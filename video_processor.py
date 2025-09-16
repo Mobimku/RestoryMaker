@@ -138,9 +138,16 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
         progress_callback(f"Created temporary working directory at: {work_dir}")
 
         processed_segment_paths = []
+        selected_segments = user_settings.get("selected_segments", [])
+
         for segment_data in storyboard.get('segments', []):
             if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
+
             segment_label = segment_data['label']
+            if segment_label not in selected_segments:
+                progress_callback(f"Skipping segment '{segment_label}' as it was not selected.")
+                continue
+
             vo_path = vo_audio_map.get(segment_label)
             if vo_path:
                 segment_path = _process_segment(segment_data, vo_path, source_video_path, work_dir, **kwargs)
