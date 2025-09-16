@@ -123,8 +123,7 @@ class App(ctk.CTk):
                 "output_path": str(Path(self.output_folder.get()) / f"{Path(self.mp4_path.get()).stem}_recap.mp4"),
                 "selected_segments": selected_segments
             }
-            srt_content = Path(self.srt_path.get()).read_text(encoding='utf-8')
-            storyboard = api_handler.get_storyboard_from_srt(srt_content, api_key, int(film_duration_sec), self.output_folder.get(), "en", progress_callback=self.log_message)
+            storyboard = api_handler.get_storyboard_from_srt(self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), "en", progress_callback=self.log_message)
             if not storyboard: raise Exception("Failed to get storyboard from API.")
             vo_audio_map = {}; temp_audio_dir = Path(self.output_folder.get()) / "temp_audio"; temp_audio_dir.mkdir(exist_ok=True)
             for i, segment in enumerate(storyboard.get('segments', [])):
