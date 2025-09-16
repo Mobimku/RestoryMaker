@@ -141,8 +141,68 @@ class App(ctk.CTk):
         except Exception as e: import traceback; self.log_message(f"FATAL ERROR: {e}"); self.log_message(traceback.format_exc())
         finally: self.after(0, lambda: (self.start_button.configure(state="normal"), self.stop_button.configure(state="disabled")))
     def setup_api_tab(self):
-        # ... (Full implementation is here, just shortened for brevity in this view)
-        pass
+        self.api_tab.grid_columnconfigure(0, weight=1)
+        # Add Key Frame
+        add_frame = ctk.CTkFrame(self.api_tab); add_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(add_frame, text="New API Key:").pack(side="left", padx=10)
+        self.new_api_key_entry = ctk.CTkEntry(add_frame, width=400, show="*"); self.new_api_key_entry.pack(side="left", fill="x", expand=True, padx=10)
+        ctk.CTkButton(add_frame, text="Add Key", command=self._add_api_key).pack(side="left", padx=10)
+
+        # Key List Frame
+        self.key_list_frame = ctk.CTkScrollableFrame(self.api_tab, label_text="Saved API Keys")
+        self.key_list_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # Management Buttons Frame
+        mgmt_frame = ctk.CTkFrame(self.api_tab); mgmt_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkButton(mgmt_frame, text="Delete Selected", command=self._delete_api_key, fg_color="red").pack(side="left", padx=10)
+        ctk.CTkButton(mgmt_frame, text="Clear All", command=self._clear_api_keys, fg_color="gray").pack(side="right", padx=10)
+
+        self._refresh_api_key_list()
+
+    def _refresh_api_key_list(self):
+        for widget in self.key_list_frame.winfo_children():
+            widget.destroy()
+
+        keys = self.api_manager.get_keys()
+        if not keys:
+            ctk.CTkLabel(self.key_list_frame, text="No API keys saved.").pack(pady=10)
+            self.selected_api_key.set("")
+            return
+
+        for key in keys:
+            masked_key = f"{key[:4]}...{key[-4:]}"
+            ctk.CTkRadioButton(self.key_list_frame, text=masked_key, variable=self.selected_api_key, value=key).pack(anchor="w", padx=10, pady=2)
+
+        if self.selected_api_key.get() not in keys:
+            self.selected_api_key.set(keys[0])
+
+    def _add_api_key(self):
+        new_key = self.new_api_key_entry.get()
+        if new_key:
+            if self.api_manager.add_key(new_key):
+                self.log_message("API Key added successfully.")
+                self._refresh_api_key_list()
+                self.new_api_key_entry.delete(0, 'end')
+            else:
+                messagebox.showwarning("Warning", "API Key already exists or is invalid.")
+        else:
+            messagebox.showwarning("Warning", "API Key field cannot be empty.")
+
+    def _delete_api_key(self):
+        key_to_delete = self.selected_api_key.get()
+        if key_to_delete:
+            if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the key ending in ...{key_to_delete[-4:]}?"):
+                self.api_manager.delete_key(key_to_delete)
+                self.log_message("API Key deleted.")
+                self._refresh_api_key_list()
+        else:
+            messagebox.showerror("Error", "No API Key selected for deletion.")
+
+    def _clear_api_keys(self):
+        if messagebox.askyesno("Confirm Clear All", "Are you sure you want to delete ALL saved API keys? This action cannot be undone."):
+            self.api_manager.clear_all_keys()
+            self.log_message("All API keys have been cleared.")
+            self._refresh_api_key_list()
     def setup_tutorial_tab(self): ctk.CTkLabel(self.tutorial_tab, text="Tutorial content will go here.").pack(padx=20, pady=20)
 
 if __name__ == "__main__":
