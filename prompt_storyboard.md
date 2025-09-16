@@ -47,7 +47,7 @@ PACING & WORD BUDGET (WAJIB):
 RENCANA VIDEO (per segmen):
 - Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
 - Total durasi hasil edit HARUS sama dengan durasi VO.
-- Pecah visual jadi klip 3–6 detik (acak namun logis).
+- Pecah visual jadi klip 3–4 detik (acak namun logis).
 - Terapkan 0–2 efek per klip, pilih dari pool: 
   ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"].
 - Hindari zoom terus-menerus. 
@@ -107,7 +107,7 @@ SKEMA JSON KELUARAN:
         {"start": "…", "end": "…", "reason": "…"}
       ],
       "edit_rules": {
-        "cut_length_sec": {"min": 3.0, "max": 6.0},
+        "cut_length_sec": {"min": 3.0, "max": 4.0},
         "effects_pool": ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"],
         "max_effects_per_clip": 2,
         "transition_every_sec": 25,
