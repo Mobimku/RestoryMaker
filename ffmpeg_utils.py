@@ -11,7 +11,7 @@ def get_duration(media_path: str):
     """
     Returns the duration of a media file in seconds using ffprobe.
     """
-    command = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {media_path}"
+    command = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{media_path}"'
     try:
         result = subprocess.check_output(shlex.split(command), stderr=subprocess.STDOUT)
         return float(result)

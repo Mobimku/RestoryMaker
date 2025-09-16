@@ -19,12 +19,12 @@ def _apply_effects(clip_path, effects, output_path, **kwargs):
     if not vf_filters:
         shutil.copy(clip_path, output_path)
         return True
-    command = f'ffmpeg -i {clip_path} -vf "{",".join(vf_filters)}" -c:a copy {output_path}'
+    command = f'ffmpeg -i "{clip_path}" -vf "{",".join(vf_filters)}" -c:a copy "{output_path}"'
     return run_ffmpeg_command(command, **kwargs)
 
 def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
     """Applies final user-defined effects like BGM, volume changes, etc."""
-    inputs = f'-i {input_path}'
+    inputs = f'-i "{input_path}"'
     video_filters = []
     audio_filters = []
     video_stream = "[0:v]"
