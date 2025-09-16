@@ -26,7 +26,7 @@ def get_storyboard_from_srt(srt_content: str, api_key: str, film_duration: int, 
         generation_config = {
             "temperature": 0.9, "top_p": 1, "top_k": 1, "max_output_tokens": 8192,
         }
-        model = genai.GenerativeModel(model_name="gemini-1.0-pro", generation_config=generation_config)
+        model = genai.GenerativeModel(model_name="gemini-pro", generation_config=generation_config)
 
         system_prompt = PROMPT_FILE.read_text(encoding='utf-8')
         system_prompt = system_prompt.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
