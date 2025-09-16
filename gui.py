@@ -163,7 +163,9 @@ class App(ctk.CTk):
             if self.stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
 
             self.log_message("Phase 1: Generating storyboard from Gemini API...")
-            storyboard = api_handler.get_storyboard_from_srt(srt_content, api_key, int(film_duration_sec), "en")
+            storyboard = api_handler.get_storyboard_from_srt(
+                srt_content, api_key, int(film_duration_sec), "en", progress_callback=self.log_message
+            )
             if not storyboard: raise Exception("Failed to get storyboard from API.")
 
             if self.stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
@@ -174,11 +176,10 @@ class App(ctk.CTk):
             temp_audio_dir.mkdir(exist_ok=True)
             for i, segment in enumerate(storyboard.get('segments', [])):
                 if self.stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
-                self.log_message(f"Generating audio for segment {i+1}/{len(storyboard.get('segments', []))}...")
                 label = segment['label']
                 script = segment['vo_script']
                 output_path = temp_audio_dir / f"vo_{label}.wav"
-                if not api_handler.generate_vo_audio(script, api_key, str(output_path)):
+                if not api_handler.generate_vo_audio(script, api_key, str(output_path), progress_callback=self.log_message):
                     raise Exception(f"Failed to generate audio for segment {label}")
                 vo_audio_map[label] = str(output_path)
 
