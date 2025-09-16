@@ -3,6 +3,7 @@
 # specifically the Google Gemini API for storyboard and speech generation.
 
 import google.generativeai as genai
+import os
 import json
 import pathlib
 import time
