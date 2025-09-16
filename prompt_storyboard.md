@@ -1,81 +1,47 @@
 # 🎬 Prompt: Storyboard Maker untuk Film Recap
 
-##PROMPT FINAL 
+## PROMPT FINAL
 
-TUGAS:
-Anda adalah Storyboard Maker berbasis SRT untuk membuat recap film dan rencana video (video plan) terstruktur. 
-Input saya adalah subtitle SRT lengkap dan akurat dari sebuah film berdurasi ± {durasi_film}. 
-Keluaran Anda HARUS mengikuti skema JSON di bawah ini.
+**TUGAS:**
+Anda adalah Storyboard Maker berbasis SRT. Input saya adalah file SRT dari film berdurasi ±{durasi_film}. Output Anda HARUS berupa JSON tunggal yang valid sesuai skema di bawah, tanpa komentar atau teks tambahan.
 
-LOGIC DASAR DURASI:
-- Total recap harus berdurasi antara 18–25 menit (≈ 1080–1500 detik).
-- Gunakan proporsi distribusi durasi per segmen sebagai berikut:
-  * Intro: 10–12% dari total recap (≈ 2.5–3 menit)
-  * Rising: 28–32% dari total recap (≈ 8–9 menit)
-  * Mid-conflict: 20–22% dari total recap (≈ 6–7 menit)
-  * Climax: 20–22% dari total recap (≈ 6–7 menit)
-  * Ending: 12–15% dari total recap (≈ 4–5 menit)
-- Jangan gunakan angka kecil seperti 30–60 detik. Selalu patuhi distribusi di atas.
-- Hitung target_vo_duration_sec otomatis berdasarkan distribusi ini.
-- Semua VO script harus ditulis agar durasi total recap sesuai target di atas.
+**ATURAN UTAMA:**
+1.  **Struktur & Durasi:**
+    *   Total durasi recap: 18–25 menit.
+    *   Bagi narasi menjadi 5 babak: Intro, Rising, Mid-conflict, Climax, Ending.
+    *   Gunakan proporsi durasi: Intro (10-12%), Rising (28-32%), Mid-conflict (20-22%), Climax (20-22%), Ending (12-15%).
+    *   Hitung `target_vo_duration_sec` untuk tiap segmen berdasarkan proporsi di atas.
 
-LANGKAH ANALISIS:
-1) Baca seluruh SRT. Identifikasi struktur naratif: Intro → Rising → Mid-conflict → Climax → Ending.
-2) Temukan momen penting (establishing context, inciting incident, turning points, confrontation, climax, resolution).
-3) Untuk setiap babak, pilih rentang timestamp SRT yang paling representatif (boleh discontinuous, 2–5 rentang).
-4) Tulis recap singkat (3–5 kalimat) per babak.
+2.  **Analisis & Recap:**
+    *   Baca seluruh SRT, identifikasi momen-momen kunci untuk setiap babak.
+    *   Pilih 2-5 rentang timestamp SRT yang paling representatif per babak (boleh tidak berurutan).
+    *   Tulis recap singkat (3-5 kalimat) per babak di field `recap`.
 
-PENULISAN VO (WAJIB):
-- Kalimat pertama HARUS menjadi **HOOK punchy** sesuai konteks segmen (12–18 kata).
-- Gunakan kata-kata berbeda dengan makna sama; ubah struktur kalimat dari SRT.
-- Pertahankan SEMUA informasi penting (jangan buang detail inti).
-- Jangan menambahkan keterangan ekstra atau karakter baru.
-- Jika ada kalimat terlalu panjang, gabungkan/kompres supaya lebih ringkas.
-- Jangan copy-paste dialog asli, VO harus hasil narasi ulang.
+3.  **Penulisan Voice-Over (VO):**
+    *   **WAJIB:** Kalimat pertama setiap VO harus menjadi **HOOK punchy** (12-18 kata).
+    *   Narasi ulang, JANGAN copy-paste dialog dari SRT.
+    *   Pertahankan semua informasi penting, tapi kompres kalimat panjang agar ringkas.
+    *   Gunakan sinonim dan struktur kalimat yang berbeda dari SRT.
 
-PACING & WORD BUDGET (WAJIB):
-- Default speech_rate_wpm: Intro 150, Rising 160, Mid-conflict 165, Climax 175, Ending 150.
-- Gunakan fill_ratio = 0.90 (90% waktu kata, 10% jeda).
-- Rumus target kata:
-  words_target ≈ target_vo_duration_sec * (speech_rate_wpm / 60) * fill_ratio
-- Tuliskan VO agar jumlah katanya mendekati words_target (±2%).
-- Setelah menulis VO, hitung:
-  predicted_duration_sec ≈ (words_actual / (speech_rate_wpm/60)) + (sentences * 0.30) + (commas * 0.12)
-  delta_sec = predicted_duration_sec - target_vo_duration_sec
-- Jika |delta_sec| > 2% → revisi VO hingga fit=OK.
+4.  **Pacing & Word Budget (INTERNAL CHECK):**
+    *   Gunakan `speech_rate_wpm`: Intro 150, Rising 160, Mid-conflict 165, Climax 175, Ending 150.
+    *   Gunakan `fill_ratio` = 0.90.
+    *   Tulis VO agar jumlah katanya mendekati `words_target` (±2%), dihitung dengan rumus:
+      `words_target ≈ target_vo_duration_sec * (speech_rate_wpm / 60) * fill_ratio`
+    *   Lakukan validasi internal dan pastikan `fit` di `vo_meta` adalah "OK" sebelum output.
 
-RENCANA VIDEO (per segmen):
-- Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
-- Total durasi hasil edit HARUS sama dengan durasi VO.
-- Pecah visual jadi klip 3–4 detik (acak namun logis).
-- Terapkan 0–2 efek per klip, pilih dari pool: 
-  ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"].
-- Hindari zoom terus-menerus. 
-- Sisipkan 1 transisi lembut per 20–30 detik (crossfade 0.4–0.6s).
-- Tambahkan `beats` opsional (milidetik) untuk menandai penempatan VO/key visuals.
+5.  **Rencana Video (per segmen):**
+    *   Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
+    *   Total durasi video edit HARUS sama dengan durasi VO.
+    *   Pecah visual jadi klip acak 3–4 detik.
+    *   Terapkan 0–2 efek per klip dari pool: ["crop_pan_light", "zoom_light", "hflip", "contrast_plus", "sat_plus", "pip_blur_bg"].
+    *   Hindari zoom berlebihan. Sisipkan transisi `crossfade` (0.4-0.6s) per 20-30 detik.
 
-VALIDASI (WAJIB):
-- Laporkan word budget di `vo_meta`:
-  * speech_rate_wpm
-  * fill_ratio
-  * words_target
-  * words_actual
-  * sentences
-  * commas
-  * predicted_duration_sec
-  * delta_sec
-  * fit ("OK" atau "REWRITE")
-- Pastikan fit="OK" sebelum output final.
-
-BATASAN:
-- Output WAJIB berupa JSON sesuai skema, tanpa komentar tambahan.
-- Bahasa keluaran: {lang}.
-- Jangan memuat catatan, penjelasan, atau format lain selain JSON.
-
-SKEMA JSON KELUARAN:
+**SKEMA JSON KELUARAN (WAJIB):**
+```json
 {
   "film_meta": {
-    "title": "{judul|opsional}", 
+    "title": "{judul|opsional}",
     "duration_sec": {durasi_total_detik}
   },
   "recap": {
@@ -89,8 +55,8 @@ SKEMA JSON KELUARAN:
     {
       "label": "Intro",
       "vo_language": "{lang}",
-      "target_vo_duration_sec": {intro_vo_sec},
-      "vo_script": "… narasi panjang dengan HOOK punchy …",
+      "target_vo_duration_sec": 0,
+      "vo_script": "…",
       "vo_meta": {
         "speech_rate_wpm": 150,
         "fill_ratio": 0.90,
@@ -103,8 +69,7 @@ SKEMA JSON KELUARAN:
         "fit": "OK"
       },
       "source_timeblocks": [
-        {"start": "HH:MM:SS.mmm", "end": "HH:MM:SS.mmm", "reason": "…"},
-        {"start": "…", "end": "…", "reason": "…"}
+        {"start": "HH:MM:SS.mmm", "end": "HH:MM:SS.mmm", "reason": "…"}
       ],
       "edit_rules": {
         "cut_length_sec": {"min": 3.0, "max": 4.0},
@@ -114,15 +79,8 @@ SKEMA JSON KELUARAN:
         "transition_type": "crossfade",
         "transition_duration_sec": 0.5
       },
-      "beats": [
-        {"at_ms": 0, "action": "logo/titlecard optional"},
-        {"at_ms": 8000, "action": "establishing wide → crop-pan"},
-        {"at_ms": 18000, "action": "insert pip+blur for commentary"}
-      ]
-    },
-    { "label": "Rising", … },
-    { "label": "Mid-conflict", … },
-    { "label": "Climax", … },
-    { "label": "Ending", … }
+      "beats": []
+    }
   ]
 }
+```

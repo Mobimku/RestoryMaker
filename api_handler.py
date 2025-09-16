@@ -32,9 +32,21 @@ def get_storyboard_from_srt(srt_content: str, api_key: str, film_duration: int, 
         log("Sending storyboard prompt to Gemini API (model: gemini-2.5-pro)...")
         response = model.generate_content(prompt_parts)
 
+        # Check for finish reason before trying to access text
+        if response.candidates[0].finish_reason.name != "STOP":
+            reason = response.candidates[0].finish_reason.name
+            log(f"ERROR: Gemini API stopped generation for a non-standard reason: {reason}")
+            if reason == "MAX_TOKENS":
+                log("This usually means the input SRT file is too long, resulting in a JSON output that exceeds the model's limit.")
+            # Save the partial response for debugging
+            debug_json_path = pathlib.Path(output_folder) / "storyboard_error_output.txt"
+            with open(debug_json_path, "w", encoding="utf-8") as f:
+                f.write(str(response))
+            log(f"Saved partial Gemini response to {debug_json_path}")
+            return None
+
         raw_json = response.text
 
-        # Save the raw response for debugging BEFORE trying to parse it.
         debug_json_path = pathlib.Path(output_folder) / "storyboard_output.txt"
         with open(debug_json_path, "w", encoding="utf-8") as f:
             f.write(raw_json)
@@ -48,7 +60,6 @@ def get_storyboard_from_srt(srt_content: str, api_key: str, film_duration: int, 
 
     except Exception as e:
         log(f"An error occurred while calling the Gemini API for storyboard: {e}")
-        # The raw_json is already saved, so the user can inspect it.
         return None
 
 def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
