@@ -3,7 +3,6 @@
 # specifically the Google Gemini API for storyboard and speech generation.
 
 import google.generativeai as genai
-from google.generativeai import types
 import json
 import pathlib
 import time
@@ -287,14 +286,16 @@ def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_c
         try:
             response = client.generate_content(
                 contents=[vo_script],
-                generation_config=types.GenerationConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name='schedar')
-                        )
-                    )
-                )
+                generation_config={
+                    "response_modalities": ["AUDIO"],
+                    "speech_config": {
+                        "voice_config": {
+                            "prebuilt_voice_config": {
+                                "voice_name": "schedar"
+                            }
+                        }
+                    }
+                }
             )
 
             # Extract audio data from response
