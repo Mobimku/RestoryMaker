@@ -1,4 +1,3 @@
 customtkinter
 google-generativeai
 google-cloud-texttospeech
-pillow
