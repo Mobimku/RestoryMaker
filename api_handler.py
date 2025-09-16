@@ -88,7 +88,7 @@ def get_storyboard_from_srt(srt_content: str, api_key: str, film_duration: int, 
         system_prompt = system_prompt.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
 
         # Sanitize SRT content to reduce potential safety triggers
-        sanitized_srt = _sanitize_srt_content(srt_content)
+        sanitized_srt = _sanitize_srt_content(srt_content, log)
 
         prompt_parts = [
             system_prompt,
@@ -211,7 +211,7 @@ def get_storyboard_from_srt(srt_content: str, api_key: str, film_duration: int, 
         log(traceback.format_exc())
         return None
 
-def _sanitize_srt_content(srt_content: str) -> str:
+def _sanitize_srt_content(srt_content: str, log) -> str:
     """
     Sanitizes SRT content to reduce potential safety triggers while preserving meaning.
     """
