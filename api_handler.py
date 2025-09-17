@@ -20,23 +20,15 @@ Anda adalah Storyboard Maker berbasis SRT untuk membuat recap film dan rencana v
 Input saya adalah subtitle SRT lengkap dan akurat dari sebuah film berdurasi ± {durasi_film}.
 Keluaran Anda HARUS mengikuti skema JSON di bawah ini.
 
-LOGIC DASAR DURASI:
-- Total recap harus berdurasi antara 18–25 menit (≈ 1080–1500 detik).
-- Gunakan proporsi distribusi durasi per segmen sebagai berikut:
-  * Intro: 10–12% dari total recap (≈ 2.5–3 menit)
-  * Rising: 28–32% dari total recap (≈ 8–9 menit)
-  * Mid-conflict: 20–22% dari total recap (≈ 6–7 menit)
-  * Climax: 20–22% dari total recap (≈ 6–7 menit)
-  * Ending: 12–15% dari total recap (≈ 4–5 menit)
-- Jangan gunakan angka kecil seperti 30–60 detik. Selalu patuhi distribusi di atas.
-- Hitung target_vo_duration_sec otomatis berdasarkan distribusi ini.
-- Semua VO script harus ditulis agar durasi total recap sesuai target di atas.
+
+- PARAMETER DURASI & KATA PER SEGMEN (WAJIB DIGUNAKAN):
+{CONCRETE_DURASI_KATA}
 
 LANGKAH ANALISIS:
 1) Baca seluruh SRT. Identifikasi struktur naratif: Intro → Rising → Mid-conflict → Climax → Ending.
 2) Temukan momen penting (establishing context, inciting incident, turning points, confrontation, climax, resolution).
-3) Untuk setiap babak, pilih rentang timestamp SRT yang paling representatif (boleh discontinuous, 2–5 rentang).
-4) Tulis recap singkat (3–5 kalimat) per babak.
+3) Untuk setiap babak, pilih rentang timestamp SRT yang paling representatif (boleh discontinuous). Jumlah rentang tidak dibatasi angka tetap; cukup untuk menyusun BEATS klip 3-4 detik hingga menutup durasi VO segmen.
+4) Tulis recap ringkas per babak yang konsisten dengan target words_target per segmen (lihat PARAMETER KONKRIT); hindari patokan jumlah kalimat tetap.
 
 PENULISAN VO (WAJIB):
 - Kalimat pertama HARUS menjadi **HOOK punchy** sesuai konteks segmen (12–18 kata).
@@ -47,25 +39,28 @@ PENULISAN VO (WAJIB):
 - Jangan copy-paste dialog asli, VO harus hasil narasi ulang.
 
 PACING & WORD BUDGET (WAJIB):
-- Default speech_rate_wpm: Intro 150, Rising 160, Mid-conflict 165, Climax 175, Ending 150.
 - Gunakan fill_ratio = 0.90 (90% waktu kata, 10% jeda).
-- Rumus target kata:
-  words_target ≈ target_vo_duration_sec * (speech_rate_wpm / 60) * fill_ratio
+- PARAMETER KONKRIT PER SEGMEN (WAJIB DIGUNAKAN):
+{CONCRETE_VO_PARAMS}
 - Tuliskan VO agar jumlah katanya mendekati words_target (±2%).
 - Setelah menulis VO, hitung:
-  predicted_duration_sec ≈ (words_actual / (speech_rate_wpm/60)) + (sentences * 0.30) + (commas * 0.12)
+  predicted_duration_sec = (words_actual / (speech_rate_wpm/60)) + (sentences * 0.30) + (commas * 0.12)
   delta_sec = predicted_duration_sec - target_vo_duration_sec
 - Jika |delta_sec| > 2% → revisi VO hingga fit=OK.
 
 RENCANA VIDEO (per segmen):
 - Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
 - Total durasi hasil edit HARUS sama dengan durasi VO.
-- Pecah visual jadi klip 3–4 detik (acak namun logis).
+- Pecah visual menjadi klip 3–4 detik secara BERURUTAN (bukan potongan kontinu panjang).
+- Urutan klip mengikuti urutan narasi/VO (ascending `at_ms`) dan menjaga progresi waktu sumber (gunakan `block_index` dan posisi di timeblock secara menaik) agar visual sinkron dengan VO.
 - Terapkan 0–2 efek per klip, pilih dari pool:
-  ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"].
-- Hindari zoom terus-menerus.
-- Sisipkan 1 transisi lembut per 20–30 detik (crossfade 0.4–0.6s).
-- Tambahkan `beats` opsional (milidetik) untuk menandai penempatan VO/key visuals.
+  ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"]. Hindari zoom terus-menerus.
+- Wajib menandai BEATS sebagai tulang visual (bone) untuk SETIAP klip 3–4 detik (tepat satu beat per klip):
+  - Struktur beat (JSON): { "at_ms": <waktu_segm_ms>, "block_index": <idx_timeblock>, "src_at_ms": <posisi_ms_dalam_timeblock>, "src_length_ms": <durasi_klip_ms>, "note": "opsional" }
+  - `src_length_ms` WAJIB berada di rentang 3000–4000 ms. Jika butuh durasi lebih panjang, pecah menjadi beberapa beat beruntun pada timeblock sama atau berikutnya — JANGAN membuat satu beat/klip kontinu > 4000 ms.
+  - `block_index` mengacu ke indeks pada array `source_timeblocks`.
+  - `at_ms` adalah posisi penempatan klip di timeline segmen (mulai 0), urut dan berkelanjutan hingga menutup durasi VO.
+  - Urutan beats wajib konsisten dan mengikuti urutan naratif timeblocks agar visual koheren.
 
 VALIDASI (WAJIB):
 - Laporkan word budget di `vo_meta`:
@@ -105,7 +100,7 @@ SKEMA JSON KELUARAN:
       "target_vo_duration_sec": {intro_vo_sec},
       "vo_script": "… narasi panjang dengan HOOK punchy …",
       "vo_meta": {
-        "speech_rate_wpm": 150,
+        "speech_rate_wpm": 190,
         "fill_ratio": 0.90,
         "words_target": 0,
         "words_actual": 0,
@@ -127,14 +122,24 @@ SKEMA JSON KELUARAN:
         "transition_duration_sec": 0.5
       },
       "beats": [
-        {"at_ms": 0, "action": "logo/titlecard optional"}
+        {"at_ms": 0, "block_index": 0, "src_at_ms": 0, "src_length_ms": 3500, "note": "opening context"}
       ]
     }
   ]
 }
 """
 
-def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, output_folder: str, language: str = "en", progress_callback=None):
+def get_storyboard_from_srt(
+    srt_path: str,
+    api_key: str,
+    film_duration: int,
+    output_folder: str,
+    language: str = "en",
+    progress_callback=None,
+    recap_minutes: int | None = None,
+    fast_mode: bool = False,
+    storyboard_model: str | None = None,
+):
     def log(msg):
         if progress_callback: progress_callback(msg)
 
@@ -146,33 +151,137 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         log(f"Berhasil mengunggah file: {uploaded_file.name}")
 
         safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
-        generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 32768}
+        # Mode cepat menggunakan model flash dengan output JSON dan batas token lebih kecil
+        allowed_models = {"gemini-2.5-flash", "gemini-2.5-pro"}
+        if storyboard_model and storyboard_model in allowed_models:
+            model_name = storyboard_model
+            log(f"Storyboard model dipilih: {model_name}")
+        else:
+            model_name = "gemini-2.5-flash" if fast_mode else "gemini-2.5-pro"
+            if fast_mode:
+                log("Mode cepat aktif: menggunakan Gemini 2.5 Flash untuk storyboard.")
+        generation_config = {
+            "temperature": 0.5 if fast_mode else 0.7,
+            "top_p": 0.8,
+            "top_k": 40,
+            # Jangan set max_output_tokens agar model memakai kapasitas default penuh
+            "response_mime_type": "application/json",
+        }
 
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",
+            model_name=model_name,
             generation_config=generation_config,
             safety_settings=safety_settings
         )
-        system_prompt = STORYBOARD_PROMPT_TEMPLATE.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
-        prompt_parts = [system_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file]
+        # Hitung parameter VO konkret di luar prompt
+        # Target total recap berdasarkan pilihan pengguna (default 22 menit)
+        total_target_sec = int((recap_minutes or 22) * 60)
+        # Distribusi tegas (sesuai rentang): Intro 11%, Rising 30%, Mid 22%, Climax 22%, Ending 15%
+        dist = {
+            "Intro": 0.11,
+            "Rising": 0.30,
+            "Mid-conflict": 0.22,
+            "Climax": 0.22,
+            "Ending": 0.15,
+        }
+        # WPM tegas per segmen (dalam rentang 185–210)
+        wpm_map = {
+            "Intro": 190,
+            "Rising": 200,
+            "Mid-conflict": 200,
+            "Climax": 205,
+            "Ending": 190,
+        }
+        fill_ratio = 0.90
+        secs_map = {k: round(v * total_target_sec) for k, v in dist.items()}
+        words_map = {k: round(secs_map[k] * (wpm_map[k] / 60.0) * fill_ratio) for k in dist.keys()}
+        vo_lines = []
+        vo_dw_lines = []
+        order = ["Intro", "Rising", "Mid-conflict", "Climax", "Ending"]
+        for k in order:
+            vo_lines.append(f"- {k}: target_vo_duration_sec={secs_map[k]}, speech_rate_wpm={wpm_map[k]}, words_target={words_map[k]}")
+            menit = secs_map[k] / 60.0
+            vo_dw_lines.append(f"- {k}: {secs_map[k]} detik (~{menit:.2f} menit), words_target={words_map[k]}")
+        concrete_params = "\n".join(vo_lines)
+        concrete_durasi_kata = "\n".join(vo_dw_lines)
 
-        log("Mengirim prompt storyboard ke Gemini API...")
+        # Log ringkas agar pengguna bisa melihat angka yang dipakai
+        try:
+            log("=== PARAMETER DURASI & KATA PER SEGMEN ===")
+            for line in vo_dw_lines: log(line)
+            log("=== PARAMETER KONKRIT VO (detik / wpm / words_target) ===")
+            for line in vo_lines: log(line)
+        except Exception:
+            pass
+
+        # Generate per segmen untuk menghindari MAX_TOKENS
+        def build_segment_prompt(label: str, vo_sec: int, wpm: int, words: int) -> str:
+            return (
+                "# Segmen Storyboard (JSON saja)\n"
+                f"Label: {label}\n"
+                f"Bahasa VO: {language}\n"
+                "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
+                "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
+                "source_timeblocks, edit_rules (cut_length_sec 3-4, efek dari pool), dan beats (satu beat per klip 3-4 detik).\n"
+                "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
+                "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
+                f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
+                "Format JSON yang diminta:\n"
+                "{\n"
+                f"  \"label\": \"{label}\",\n"
+                f"  \"vo_language\": \"{language}\",\n"
+                f"  \"target_vo_duration_sec\": {vo_sec},\n"
+                "  \"vo_script\": \"...\",\n"
+                "  \"vo_meta\": {\n"
+                f"    \"speech_rate_wpm\": {wpm},\n"
+                "    \"fill_ratio\": 0.90,\n"
+                f"    \"words_target\": {words},\n"
+                "    \"words_actual\": 0,\n"
+                "    \"sentences\": 0,\n"
+                "    \"commas\": 0,\n"
+                "    \"predicted_duration_sec\": 0.0,\n"
+                "    \"delta_sec\": 0.0,\n"
+                "    \"fit\": \"OK\"\n"
+                "  },\n"
+                "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
+                "  \"edit_rules\": {\n"
+                "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
+                "    \"effects_pool\": [\"crop_pan_light\",\"zoom_light\",\"hflip\",\"contrast_plus\",\"sat_plus\",\"pip_blur_bg\"],\n"
+                "    \"max_effects_per_clip\": 2,\n"
+                "    \"transition_every_sec\": 25,\n"
+                "    \"transition_type\": \"crossfade\",\n"
+                "    \"transition_duration_sec\": 0.5\n"
+                "  },\n"
+                "  \"beats\": [ {\"at_ms\": 0, \"block_index\": 0, \"src_at_ms\": 0, \"src_length_ms\": 3500, \"note\": \"...\"} ]\n"
+                "}\n"
+            )
+
+        # Kembali ke permintaan prompt utuh (single call)
+        system_prompt = STORYBOARD_PROMPT_TEMPLATE \
+            .replace("{durasi_film}", str(film_duration // 60)) \
+            .replace("{durasi_total_detik}", str(int(film_duration))) \
+            .replace("{lang}", language) \
+            .replace("{CONCRETE_VO_PARAMS}", concrete_params) \
+            .replace("{CONCRETE_DURASI_KATA}", concrete_durasi_kata) \
+            .replace("{intro_vo_sec}", str(secs_map["Intro"])) \
+            .replace("{rising_vo_sec}", str(secs_map["Rising"])) \
+            .replace("{mid_vo_sec}", str(secs_map["Mid-conflict"])) \
+            .replace("{climax_vo_sec}", str(secs_map["Climax"])) \
+            .replace("{ending_vo_sec}", str(secs_map["Ending"]))
+
+        prompt_parts = [system_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file]
+        log("Mengirim prompt storyboard (single call) ke Gemini API...")
         response = model.generate_content(prompt_parts, request_options={'timeout': 600})
 
         if not response.candidates:
             log(f"ERROR: Prompt diblokir oleh API. Feedback: {response.prompt_feedback}")
             return None
-
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
-             log(f"ERROR: Respons dihentikan dengan alasan: {candidate.finish_reason.name}.")
-             if candidate.finish_reason.name == "SAFETY":
-                 log("Ini kemungkinan besar karena setelan keamanan. Konten file SRT mungkin telah ditandai.")
-                 log(f"Peringkat keamanan: {candidate.safety_ratings}")
-             return None
+            log(f"ERROR: Respons dihentikan dengan alasan: {candidate.finish_reason.name}.")
+            return None
 
         raw_response_text = response.text
-        # Simpan raw ke file debug (opsional)
         raw_path = pathlib.Path(output_folder) / "storyboard_output_raw.txt"
         try:
             with open(raw_path, "w", encoding="utf-8") as f: f.write(raw_response_text)
@@ -180,7 +289,6 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         except Exception:
             pass
 
-        # Bersihkan code fence lalu parse JSON, dan simpan ke .json
         response_text = raw_response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         log("Mem-parsing JSON dari respons Gemini...")
         parsed = json.loads(response_text)
@@ -209,32 +317,12 @@ def generate_vo_audio(
     voice_prompt_path: str = "",
     speech_rate_wpm: int | None = None,
     max_chunk_sec: int | None = None,
-    tts_backend: str = "gemini",
 ):
     def log(msg):
         if progress_callback: progress_callback(msg)
 
     # Pilih backend: gemini (default) atau lokal (Chatterbox)
-    if (tts_backend or "gemini").lower() in ("local", "chatterbox"):
-        try:
-            from tts_chatterbox import synthesize_with_chatterbox
-            lang = (language_code or "en").split('-')[0]
-            if progress_callback:
-                progress_callback(f"Membuat VO via Chatterbox (bahasa: {lang}, device: {tts_device})...")
-            ok = synthesize_with_chatterbox(
-                vo_script,
-                output_mp3_path=output_path,
-                language_code=lang,
-                progress_callback=progress_callback,
-                device=tts_device or "cpu",
-                audio_prompt_path=voice_prompt_path if voice_prompt_path else None,
-            )
-            return bool(ok)
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"FATAL: Chatterbox backend error: {e}")
-                progress_callback(traceback.format_exc())
-            return False
+    # Pakai Gemini TTS selalu (hapus backend lokal)
 
     # Backend: Gemini 2.5 Flash Preview TTS dan pecah per ~3 menit
     try:
@@ -245,7 +333,7 @@ def generate_vo_audio(
         model = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
 
         # Bagi teks menjadi chunk ~3 menit berdasarkan WPM jika tersedia; fallback ke panjang karakter
-        chunks = _split_text_for_tts_by_duration(vo_script, speech_rate_wpm or 160, max_sec=(max_chunk_sec or 180))
+        chunks = _split_text_for_tts_by_duration(vo_script, speech_rate_wpm or 195, max_sec=(max_chunk_sec or 180))
         total = len(chunks)
         log(f"Menyiapkan TTS Gemini Flash: {total} potongan (~3 menit per potong)...")
 
@@ -451,4 +539,7 @@ def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, lo
         log_func(f"Membuat placeholder MP3 hening di {output_path}")
     except Exception as e:
         log_func(f"FFmpeg gagal membuat MP3 hening: {e}")
+
+
+
 

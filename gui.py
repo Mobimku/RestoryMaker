@@ -40,15 +40,17 @@ class App(ctk.CTk):
 
     def setup_editor_tab(self):
         # ... (This method is unchanged)
-        self.editor_tab.grid_columnconfigure(0, weight=3); self.editor_tab.grid_columnconfigure(1, weight=2); self.editor_tab.grid_rowconfigure(1, weight=1)
-        left_col = ctk.CTkFrame(self.editor_tab); left_col.grid(row=0, column=0, rowspan=3, padx=10, pady=10, sticky="nsew"); left_col.grid_rowconfigure(1, weight=1)
+        # Samakan lebar panel kiri/kanan
+        self.editor_tab.grid_columnconfigure(0, weight=1); self.editor_tab.grid_columnconfigure(1, weight=1); self.editor_tab.grid_rowconfigure(1, weight=1)
+        left_col = ctk.CTkScrollableFrame(self.editor_tab); left_col.grid(row=0, column=0, rowspan=3, padx=10, pady=10, sticky="nsew")
         right_col = ctk.CTkScrollableFrame(self.editor_tab); right_col.grid(row=0, column=1, rowspan=3, padx=10, pady=10, sticky="nsew")
         file_io_frame = ctk.CTkFrame(left_col); file_io_frame.pack(padx=10, pady=10, fill="x"); file_io_frame.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(file_io_frame, text="MP4 File").grid(row=0, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.mp4_path, state="disabled").grid(row=0, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_mp4_file).grid(row=0, column=2, **self.grid_opts())
         ctk.CTkLabel(file_io_frame, text="SRT File").grid(row=1, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.srt_path, state="disabled").grid(row=1, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_srt_file).grid(row=1, column=2, **self.grid_opts())
         ctk.CTkLabel(file_io_frame, text="Output Folder").grid(row=2, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.output_folder, state="disabled").grid(row=2, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_output_folder).grid(row=2, column=2, **self.grid_opts())
         ctk.CTkLabel(file_io_frame, text="Storyboard JSON (optional)").grid(row=3, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.storyboard_path, state="disabled").grid(row=3, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_storyboard_file).grid(row=3, column=2, **self.grid_opts())
-        self.log_box = ctk.CTkTextbox(left_col, state="disabled", wrap="word"); self.log_box.pack(padx=10, pady=10, fill="both", expand=True)
+        # Perkecil log box agar panel kiri tidak terlalu panjang
+        self.log_box = ctk.CTkTextbox(left_col, state="disabled", wrap="word", height=180); self.log_box.pack(padx=10, pady=10, fill="x")
         progress_frame = ctk.CTkFrame(left_col); progress_frame.pack(padx=10, pady=10, fill="x"); progress_frame.grid_columnconfigure(0, weight=1)
         self.progress_bar = ctk.CTkProgressBar(progress_frame); self.progress_bar.set(0); self.progress_bar.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
         self.start_button = ctk.CTkButton(progress_frame, text="Start Processing", command=self._start_processing); self.start_button.grid(row=0, column=1, padx=10, pady=10)
@@ -56,18 +58,20 @@ class App(ctk.CTk):
         canvas_frame = ctk.CTkFrame(right_col); canvas_frame.pack(padx=10, pady=10, fill="x")
         ctk.CTkLabel(canvas_frame, text="Canvas Settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
         ctk.CTkLabel(canvas_frame, text="Letterbox (movie bars) diterapkan default saat render akhir.", wraplength=350, text_color="gray").pack(anchor="w", padx=10, pady=5)
+        # Pindahkan Recap Duration ke panel kiri agar panel kanan tidak terlalu panjang
+        duration_frame = ctk.CTkFrame(left_col); duration_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(duration_frame, text="Recap Duration (minutes)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
+        self.recap_minutes_var = ctk.StringVar(value="22")
+        self.recap_minutes_menu = ctk.CTkOptionMenu(duration_frame, values=[str(x) for x in range(18, 26)], variable=self.recap_minutes_var)
+        self.recap_minutes_menu.pack(fill="x", padx=10, pady=5)
+        # Storyboard model selector
+        model_frame = ctk.CTkFrame(left_col); model_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(model_frame, text="Storyboard Model", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
+        self.storyboard_model_var = ctk.StringVar(value="gemini-2.5-flash")
+        self.storyboard_model_menu = ctk.CTkOptionMenu(model_frame, values=["gemini-2.5-flash", "gemini-2.5-pro"], variable=self.storyboard_model_var)
+        self.storyboard_model_menu.pack(fill="x", padx=10, pady=5)
         audio_frame = ctk.CTkFrame(right_col); audio_frame.pack(padx=10, pady=10, fill="x", pady_=(10,10))
         ctk.CTkLabel(audio_frame, text="Audio Settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
-        # TTS Backend selection
-        ctk.CTkLabel(audio_frame, text="TTS Backend").pack(anchor="w", padx=10, pady=(10, 0))
-        self.tts_backend_var = ctk.StringVar(value="gemini")
-        self.tts_backend_menu = ctk.CTkOptionMenu(audio_frame, values=["gemini", "local"], variable=self.tts_backend_var)
-        self.tts_backend_menu.pack(fill="x", padx=10, pady=5)
-        # TTS Backend selection
-        ctk.CTkLabel(audio_frame, text="TTS Backend").pack(anchor="w", padx=10, pady=(10, 0))
-        self.tts_backend_var = ctk.StringVar(value="gemini")
-        self.tts_backend_menu = ctk.CTkOptionMenu(audio_frame, values=["gemini", "local"], variable=self.tts_backend_var)
-        self.tts_backend_menu.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(audio_frame, text="Main VO Volume (%)").pack(anchor="w", padx=10, pady=(10, 0))
         self.main_vol_slider = ctk.CTkSlider(audio_frame, from_=0, to=300); self.main_vol_slider.pack(fill="x", padx=10, pady=5); self.main_vol_slider.set(100)
         # Voice name untuk TTS
@@ -81,18 +85,9 @@ class App(ctk.CTk):
         ]
         self.tts_lang_menu = ctk.CTkOptionMenu(audio_frame, values=tts_lang_values, variable=self.tts_lang_var)
         self.tts_lang_menu.pack(fill="x", padx=10, pady=5)
-        # TTS Device
-        ctk.CTkLabel(audio_frame, text="TTS Device").pack(anchor="w", padx=10, pady=(10, 0))
+        # TTS Device (diabaikan untuk Gemini; sembunyikan opsi)
         self.tts_device_var = ctk.StringVar(value="cpu")
-        self.tts_device_menu = ctk.CTkOptionMenu(audio_frame, values=["cpu", "cuda"], variable=self.tts_device_var)
-        self.tts_device_menu.pack(fill="x", padx=10, pady=5)
-        # Voice Prompt Audio (optional)
-        prompt_frame = ctk.CTkFrame(audio_frame); prompt_frame.pack(padx=10, pady=10, fill="x")
-        ctk.CTkLabel(prompt_frame, text="Voice Prompt Audio (opsional)").pack(anchor="w")
-        self.tts_prompt_path = ctk.StringVar()
-        ctk.CTkButton(prompt_frame, text="Browse Voice Prompt...", command=self._select_tts_prompt_file).pack(fill="x", pady=5)
-        self.tts_prompt_label = ctk.CTkLabel(prompt_frame, text="No prompt selected.", text_color="gray", wraplength=250)
-        self.tts_prompt_label.pack(anchor="w")
+        # Voice Prompt Audio dihapus (tidak diperlukan)
         ctk.CTkButton(audio_frame, text="Add Background Music...", command=self._select_bgm_file).pack(fill="x", padx=10, pady=10)
         self.bgm_label = ctk.CTkLabel(audio_frame, text="No BGM file selected.", text_color="gray", wraplength=250); self.bgm_label.pack(anchor="w", padx=10)
         ctk.CTkLabel(audio_frame, text="BGM Volume (%)").pack(anchor="w", padx=10, pady=(10, 0))
@@ -109,9 +104,10 @@ class App(ctk.CTk):
             cb = ctk.CTkCheckBox(segment_frame, text=name, variable=self.segment_vars[name]); cb.pack(anchor="w", padx=30, pady=2); self.segment_checkboxes[name] = cb
         self._toggle_all_segments()
 
-        # VO override scrollable section
-        vo_override_frame = ctk.CTkScrollableFrame(right_col, label_text="VO Override (gunakan audio Anda per-segmen)")
-        vo_override_frame.pack(padx=10, pady=10, fill="both")
+        # VO override section (pindah ke panel kiri)
+        vo_override_frame = ctk.CTkFrame(left_col)
+        vo_override_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(vo_override_frame, text="VO Override (gunakan audio Anda per-segmen)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
         ctk.CTkLabel(vo_override_frame, text="Catatan: Jika memakai VO override, wajib memilih Storyboard JSON terlebih dahulu.", text_color="orange").pack(anchor="w", padx=10, pady=(0,5))
         self.vo_override_browse = {}
         self.vo_override_labels = {}
@@ -154,14 +150,7 @@ class App(ctk.CTk):
         else:
             self.vo_override_files[name].set("")
             self.vo_override_labels[name].configure(text="No file selected.", text_color="gray")
-    def _select_tts_prompt_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Audio", "*.wav *.mp3 *.flac *.m4a"), ("All", "*.*")])
-        if path:
-            self.tts_prompt_path.set(path)
-            self.tts_prompt_label.configure(text=os.path.basename(path), text_color="white")
-        else:
-            self.tts_prompt_path.set("")
-            self.tts_prompt_label.configure(text="No prompt selected.", text_color="gray")
+    # Voice Prompt handler dihapus
     def _select_bgm_file(self):
         path = filedialog.askopenfilename(filetypes=[("Audio", "*.mp3 *.wav")]);
         if path:
@@ -216,11 +205,20 @@ class App(ctk.CTk):
             detected_lang = "en"
 
         self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.stop_event.clear()
-        self.processing_thread = threading.Thread(target=self._processing_thread_target, args=(film_duration_sec, api_key_to_use, detected_lang)); self.processing_thread.start()
+        # Pass selected recap duration (int)
+        try:
+            recap_minutes = int(self.recap_minutes_var.get())
+        except Exception:
+            recap_minutes = 22
+        self.fast_storyboard_var = getattr(self, 'fast_storyboard_var', None)
+        if self.fast_storyboard_var is None:
+            self.fast_storyboard_var = ctk.BooleanVar(value=True)
+        model_choice = getattr(self, 'storyboard_model_var', None).get() if hasattr(self, 'storyboard_model_var') else "gemini-2.5-flash"
+        self.processing_thread = threading.Thread(target=self._processing_thread_target, args=(film_duration_sec, api_key_to_use, detected_lang, recap_minutes, model_choice)); self.processing_thread.start()
 
     def _stop_processing(self): self.log_message("STOP signal sent..."); self.stop_event.set()
 
-    def _processing_thread_target(self, film_duration_sec, api_key, language_code):
+    def _processing_thread_target(self, film_duration_sec, api_key, language_code, recap_minutes, model_choice):
         try:
             selected_segments = [name for name, var in self.segment_vars.items() if var.get()]
             if not selected_segments: raise Exception("No segments selected for processing.")
@@ -303,7 +301,12 @@ class App(ctk.CTk):
                                 df.write(raw)
                             raise Exception(f"Format file storyboard tidak berisi JSON valid. Salinan mentah disimpan ke {dbg}")
             else:
-                storyboard = api_handler.get_storyboard_from_srt(self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code, self.log_message)
+                storyboard = api_handler.get_storyboard_from_srt(
+                    self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code,
+                    self.log_message, recap_minutes,
+                    fast_mode=(model_choice == "gemini-2.5-flash"),
+                    storyboard_model=model_choice
+                )
                 if not storyboard: raise Exception("Gagal mendapatkan storyboard dari API.")
 
             vo_audio_map = {}; temp_audio_dir = Path(self.output_folder.get()) / "temp_audio"; temp_audio_dir.mkdir(exist_ok=True)
@@ -349,10 +352,9 @@ class App(ctk.CTk):
                         voice_name=voice_name,
                         progress_callback=self.log_message,
                         tts_device=self.tts_device_var.get(),
-                        voice_prompt_path=self.tts_prompt_path.get(),
+                        voice_prompt_path="",
                         speech_rate_wpm=(segment.get('vo_meta', {}).get('speech_rate_wpm') if isinstance(segment.get('vo_meta'), dict) else None),
                         max_chunk_sec=max_chunk_sec,
-                        tts_backend=self.tts_backend_var.get(),
                     ):
                         audio_success = True
                         break

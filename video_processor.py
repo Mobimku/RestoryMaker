@@ -23,7 +23,17 @@ def _apply_effects(clip_path, effects, output_path, **kwargs):
     if not effects:
         shutil.copy(clip_path, output_path)
         return True
-    filter_map = {"hflip": "hflip", "contrast_plus": "eq=contrast=1.1:saturation=1.2"}
+    # Build visual filters based on effect names
+    filter_map = {
+        "hflip": "hflip",
+        # Slight color boost
+        "contrast_plus": "eq=contrast=1.08:saturation=1.15",
+        "sat_plus": "eq=saturation=1.15",
+        # Slight static zoom-in (no speed change)
+        "zoom_light": "scale=iw*1.06:ih*1.06,crop=iw:ih",
+        # Gentle horizontal pan with small zoom to avoid black borders (uses time t)
+        "crop_pan_light": "scale=iw*1.06:ih*1.06,crop=iw:ih:x='(in_w-iw)/2 - 20*t':y='(in_h-ih)/2'",
+    }
     vf_filters = [filter_map[effect] for effect in effects if effect in filter_map]
     if not vf_filters:
         shutil.copy(clip_path, output_path)
@@ -39,7 +49,8 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
 
     main_vol = user_settings.get("main_vo_volume", 1.0)
     if main_vol != 1.0:
-        audio_filters.append(f"[{audio_stream}]volume={main_vol}[a_main_vol]")
+        # audio_stream already includes brackets, e.g., "[0:a]"
+        audio_filters.append(f"{audio_stream}volume={main_vol}[a_main_vol]")
         audio_stream = "[a_main_vol]"
 
     if user_settings.get("bgm_path"):
@@ -77,9 +88,14 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
         return True
 
     filter_complex = ";".join(video_filters + audio_filters)
+    # Tentukan pemetaan audio: jika tidak ada audio filter, map langsung 0:a (bukan label filter)
+    used_audio_filters = len(audio_filters) > 0
+    video_map = f'"{video_stream}"'  # video_stream adalah label filter seperti [v_out]
+    audio_map = f'"{audio_stream}"' if used_audio_filters else '0:a'
     # OPTIMASI KECEPATAN
     command = (f'ffmpeg {inputs} -filter_complex "{filter_complex}" '
-               f'-map "{video_stream}" -map "{audio_stream}" -c:v libx264 -preset veryfast {output_path}')
+               f'-map {video_map} -map {audio_map} -r 25 -c:v libx264 -preset veryfast '
+               f'-c:a aac -b:a 128k -ar 48000 -ac 2 {output_path}')
     return run_ffmpeg_command(command, **kwargs)
 
 def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, stop_event, **kwargs):
@@ -89,53 +105,109 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
     segment_work_dir = work_dir / segment_label
     segment_work_dir.mkdir(exist_ok=True)
 
-    timeblock_clips = []
-    for i, tb in enumerate(segment_data.get('source_timeblocks', [])):
-        if stop_event.is_set(): return None
-        # PERBAIKAN TIMESTAMP
-        start_time = tb['start'].replace(',', '.')
-        end_time = tb['end'].replace(',', '.')
-        # Hitung durasi untuk pemotongan yang lebih robust (re-encode)
-        start_sec = _ts_to_seconds(start_time)
-        end_sec = _ts_to_seconds(end_time)
-        duration = max(0.01, end_sec - start_sec)
-        clip_path = segment_work_dir / f"tb_{i}.mp4"
-        # Re-encode untuk menghindari error non-monotonic DTS / stream mismatch
-        command = (
-            f"ffmpeg -ss {start_sec:.3f} -t {duration:.3f} -i \"{source_video_path}\" "
-            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{clip_path}\""
-        )
-        if not run_ffmpeg_command(command, **kwargs):
-            kwargs['progress_callback'](f"ERROR: Gagal memotong timeblock {i} untuk {segment_label}")
+    # Build selected clips either from beats (preferred) or fallback 3-4s sequence
+    selected = []
+    beats = segment_data.get('beats', []) or []
+    source_tbs = segment_data.get('source_timeblocks', []) or []
+    if beats and source_tbs:
+        beat_clips_dir = segment_work_dir / "beat_clips"; beat_clips_dir.mkdir(exist_ok=True)
+        try:
+            beats_sorted = sorted(beats, key=lambda b: b.get('at_ms', 0))
+        except Exception:
+            beats_sorted = beats
+        for bi, b in enumerate(beats_sorted):
+            if stop_event.is_set(): return None
+            try:
+                block_index = int(b.get('block_index', 0))
+                src_off = max(0.0, float(b.get('src_at_ms', 0)) / 1000.0)
+                src_len = max(0.01, float(b.get('src_length_ms', 0)) / 1000.0)
+            except Exception:
+                continue
+            if block_index < 0 or block_index >= len(source_tbs):
+                continue
+            tb = source_tbs[block_index]
+            tb_start = _ts_to_seconds(str(tb['start']).replace(',', '.'))
+            tb_end = _ts_to_seconds(str(tb['end']).replace(',', '.'))
+            cur = tb_start + src_off
+            remaining = min(src_len, max(0.01, tb_end - cur))
+            # enforce 3-4s per cut; split long range into ~3.5s pieces
+            while remaining > 0.1:
+                if stop_event.is_set(): return None
+                desired = 3.5
+                dur = min(remaining, 4.0)
+                if dur >= 3.0:
+                    dur = min(dur, desired)
+                out_clip = beat_clips_dir / f"beat_{bi:03d}_{len(selected):03d}.mp4"
+                cmd = (
+                    f"ffmpeg -ss {cur:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
+                    f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{out_clip}\""
+                )
+                if not run_ffmpeg_command(cmd, **kwargs): return None
+                selected.append(out_clip)
+                cur += dur
+                remaining -= dur
+        if not selected:
             return None
-        timeblock_clips.append(clip_path)
+    else:
+        # Fallback: timeblocks → join → segment → split 3-4s → select sequentially until VO duration
+        timeblock_clips = []
+        for i, tb in enumerate(source_tbs):
+            if stop_event.is_set(): return None
+            start_sec = _ts_to_seconds(str(tb['start']).replace(',', '.'))
+            end_sec = _ts_to_seconds(str(tb['end']).replace(',', '.'))
+            duration = max(0.01, end_sec - start_sec)
+            clip_path = segment_work_dir / f"tb_{i}.mp4"
+            cmd = (
+                f"ffmpeg -ss {start_sec:.3f} -t {duration:.3f} -i \"{source_video_path}\" "
+                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{clip_path}\""
+            )
+            if not run_ffmpeg_command(cmd, **kwargs): return None
+            timeblock_clips.append(clip_path)
 
-    if stop_event.is_set(): return None
-    concat_list_path = segment_work_dir / "concat_list.txt"
-    with open(concat_list_path, "w", encoding="utf-8") as f:
-        for clip in timeblock_clips: f.write(f"file '{clip.resolve().as_posix()}'\n")
-
-    seg_raw_path = segment_work_dir / "seg_raw.mp4"
-    # PERBAIKAN NON-MONOTONIC DTS
-    concat_command_1 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
-                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_raw_path}\"")
-    if not run_ffmpeg_command(concat_command_1, **kwargs): return None
-
-    if stop_event.is_set(): return None
-    cut_rules = segment_data.get('edit_rules', {})
-    split_time = (cut_rules.get('cut_length_sec', {}).get('min', 3) + cut_rules.get('cut_length_sec', {}).get('max', 4)) / 2
-    raw_clips_dir = segment_work_dir / "raw_clips"; raw_clips_dir.mkdir(exist_ok=True)
-    if not run_ffmpeg_command(f"ffmpeg -i \"{seg_raw_path}\" -c copy -map 0 -segment_time {split_time} -f segment -reset_timestamps 1 \"{raw_clips_dir / 'clip_%03d.mp4'}\"", **kwargs): return None
-
-    raw_clips = sorted(list(raw_clips_dir.glob("*.mp4"))); random.shuffle(raw_clips)
-    effected_clips_dir = segment_work_dir / "effected_clips"; effected_clips_dir.mkdir(exist_ok=True)
-    effect_rules = segment_data.get('edit_rules', {}); effects_pool, max_effects = effect_rules.get('effects_pool', []), effect_rules.get('max_effects_per_clip', 0)
-    effected_clips = []
-    for i, clip_path in enumerate(raw_clips):
         if stop_event.is_set(): return None
-        num_effects = random.randint(0, max_effects); selected_effects = random.sample(effects_pool, num_effects) if num_effects > 0 else []
+        concat_list_path = segment_work_dir / "concat_list.txt"
+        with open(concat_list_path, "w", encoding="utf-8") as f:
+            for clip in timeblock_clips: f.write(f"file '{clip.resolve().as_posix()}'\n")
+
+        seg_raw_path = segment_work_dir / "seg_raw.mp4"
+        concat_command_1 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
+                            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_raw_path}\"")
+        if not run_ffmpeg_command(concat_command_1, **kwargs): return None
+
+        if stop_event.is_set(): return None
+        cut_rules = segment_data.get('edit_rules', {})
+        split_time = (cut_rules.get('cut_length_sec', {}).get('min', 3) + cut_rules.get('cut_length_sec', {}).get('max', 4)) / 2
+        raw_clips_dir = segment_work_dir / "raw_clips"; raw_clips_dir.mkdir(exist_ok=True)
+        if not run_ffmpeg_command(f"ffmpeg -i \"{seg_raw_path}\" -c copy -map 0 -segment_time {split_time} -f segment -reset_timestamps 1 \"{raw_clips_dir / 'clip_%03d.mp4'}\"", **kwargs): return None
+
+        raw_clips = sorted(list(raw_clips_dir.glob("*.mp4")))
+        vo_duration = get_duration(vo_audio_path)
+        if not vo_duration or vo_duration <= 0: return None
+        acc = 0.0
+        for clip in raw_clips:
+            if stop_event.is_set(): return None
+            d = get_duration(str(clip)) or 0.0
+            selected.append(clip)
+            acc += float(d)
+            if acc >= float(vo_duration): break
+        if not selected: return None
+
+    effected_clips_dir = segment_work_dir / "effected_clips"; effected_clips_dir.mkdir(exist_ok=True)
+    effect_rules = segment_data.get('edit_rules', {})
+    effects_pool, max_effects = effect_rules.get('effects_pool', []), effect_rules.get('max_effects_per_clip', 0)
+    effected_clips = []
+    for i, clip_path in enumerate(selected):
+        if stop_event.is_set(): return None
+        num_effects = random.randint(0, max_effects)
+        selected_effects = random.sample(effects_pool, num_effects) if num_effects > 0 and effects_pool else []
+        # Default effects if none selected: color boost + one of zoom/pan
+        if not selected_effects:
+            base = ["contrast_plus"]
+            base.append(random.choice(["zoom_light", "crop_pan_light"]))
+            selected_effects = base
         output_path = effected_clips_dir / f"effected_{i:03d}.mp4"
-        if _apply_effects(clip_path, selected_effects, output_path, **kwargs): effected_clips.append(output_path)
+        if _apply_effects(clip_path, selected_effects, output_path, **kwargs):
+            effected_clips.append(output_path)
 
     if stop_event.is_set(): return None
     concat_list_path_2 = segment_work_dir / "concat_list_2.txt"
@@ -143,25 +215,36 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
         for clip in effected_clips: f.write(f"file '{clip.resolve().as_posix()}'\n")
     seg_joined_path = segment_work_dir / "seg_joined.mp4"
     concat_command_2 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" "
-                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_joined_path}\"")
+                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{seg_joined_path}\"")
     if not run_ffmpeg_command(concat_command_2, **kwargs): return None
 
     if stop_event.is_set(): return None
-    vo_duration = get_duration(vo_audio_path); video_duration = get_duration(seg_joined_path)
-    if not vo_duration or not video_duration: return None
-
-    final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp3" # Outputting mp3 to match audio
-    # OPTIMASI KECEPATAN
-    command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
-               f'-filter_complex "[0:v]setpts=({vo_duration}/{video_duration})*PTS[v]" '
-               f'-map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k \"{final_segment_path}\"')
+    final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp4"
+    # Gabungkan video + VO, potong ke stream terpendek (VO) tanpa mengubah kecepatan
+    main_vol = kwargs.get("main_vo_volume", 1.0)
+    if main_vol and main_vol != 1.0:
+        cb = kwargs.get("progress_callback")
+        if cb:
+            try:
+                cb(f"Applying VO gain x{main_vol:.2f} for segment '{segment_label}'")
+            except Exception:
+                pass
+    if main_vol and main_vol != 1.0:
+        command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
+                   f'-filter_complex "[1:a]volume={main_vol}[a1]" '
+                   f'-map 0:v -map "[a1]" -shortest -r 25 -c:v libx264 -preset veryfast -crf 23 '
+                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 \"{final_segment_path}\"')
+    else:
+        command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
+                   f'-map 0:v -map 1:a -shortest -r 25 -c:v libx264 -preset veryfast -crf 23 '
+                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 \"{final_segment_path}\"')
     if not run_ffmpeg_command(command, **kwargs): return None
     return final_segment_path
 
 def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, user_settings: dict, stop_event: threading.Event, progress_callback=None):
     base_dir = pathlib.Path(source_video_path).parent
     work_dir = base_dir / "temp_restory_work"
-    kwargs = {"progress_callback": progress_callback}
+    kwargs = {"progress_callback": progress_callback, "main_vo_volume": user_settings.get("main_vo_volume", 1.0)}
 
     try:
         if work_dir.exists(): shutil.rmtree(work_dir)
