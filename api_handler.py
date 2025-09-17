@@ -138,27 +138,16 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         genai.configure(api_key=api_key)
         log(f"Mengunggah file SRT: {srt_path}...")
         uploaded_file = genai.upload_file(path=srt_path)
- feat/restorymaker-gui-app
-        log(f"Successfully uploaded file: {uploaded_file.name}")
+        log(f"Berhasil mengunggah file: {uploaded_file.name}")
 
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
-        
-        # SOLUSI: Menaikkan batas output token secara signifikan
- main
+        safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 32768}
 
         model = genai.GenerativeModel(
-            # MODEL TETAP SESUAI PERMINTAAN PENGGUNA
-            model_name="gemini-2.5-pro", 
+            model_name="gemini-2.5-pro",
             generation_config=generation_config,
             safety_settings=safety_settings
         )
-
         system_prompt = STORYBOARD_PROMPT_TEMPLATE.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
         prompt_parts = [system_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file]
 
@@ -166,35 +155,33 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         response = model.generate_content(prompt_parts, request_options={'timeout': 600})
 
         if not response.candidates:
-            log(f"ERROR: Prompt was blocked by the API. Feedback: {response.prompt_feedback}")
+            log(f"ERROR: Prompt diblokir oleh API. Feedback: {response.prompt_feedback}")
             return None
 
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
-             log(f"ERROR: Response was stopped with reason: {candidate.finish_reason.name}.")
+             log(f"ERROR: Respons dihentikan dengan alasan: {candidate.finish_reason.name}.")
              if candidate.finish_reason.name == "SAFETY":
-                 log("This is likely due to safety settings. The SRT file content may have been flagged.")
-                 log(f"Safety ratings: {candidate.safety_ratings}")
+                 log("Ini kemungkinan besar karena setelan keamanan. Konten file SRT mungkin telah ditandai.")
+                 log(f"Peringkat keamanan: {candidate.safety_ratings}")
              return None
 
         raw_response_text = response.text
-
         debug_json_path = pathlib.Path(output_folder) / "storyboard_output.txt"
         with open(debug_json_path, "w", encoding="utf-8") as f: f.write(raw_response_text)
-        log(f"Saved raw Gemini response to {debug_json_path}")
+        log(f"Menyimpan respons mentah Gemini ke {debug_json_path}")
 
         response_text = raw_response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        log("Parsing JSON...")
+        log("Mem-parsing JSON...")
         return json.loads(response_text)
     except Exception as e:
-        log(f"An error occurred calling Gemini API: {e}")
+        log(f"Terjadi error saat memanggil Gemini API: {e}")
         log(traceback.format_exc())
         return None
     finally:
         if uploaded_file:
-            log(f"Deleting uploaded file from service: {uploaded_file.name}")
+            log(f"Menghapus file yang diunggah dari layanan: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
-
 
 def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
     def log(msg):
@@ -202,7 +189,7 @@ def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_c
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name="models/tts-1")
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-tts")
         log(f"Meminta stream audio TTS dari Gemini (bahasa: {language_code})...")
 
         response = model.generate_content(vo_script)
