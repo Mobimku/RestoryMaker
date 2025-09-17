@@ -138,13 +138,23 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         genai.configure(api_key=api_key)
         log(f"Mengunggah file SRT: {srt_path}...")
         uploaded_file = genai.upload_file(path=srt_path)
-        log(f"Berhasil mengunggah file: {uploaded_file.name}")
+ feat/restorymaker-gui-app
+        log(f"Successfully uploaded file: {uploaded_file.name}")
 
-        safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ]
+        
+        # SOLUSI: Menaikkan batas output token secara signifikan
+ main
         generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 32768}
 
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",
+            # MODEL TETAP SESUAI PERMINTAAN PENGGUNA
+            model_name="gemini-2.5-pro", 
             generation_config=generation_config,
             safety_settings=safety_settings
         )
@@ -184,6 +194,7 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         if uploaded_file:
             log(f"Deleting uploaded file from service: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
+
 
 def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
     def log(msg):
