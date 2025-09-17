@@ -155,19 +155,19 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         uploaded_file = genai.upload_file(path=srt_path)
         log(f"Successfully uploaded file: {uploaded_file.name}")
 
-        # SOLUSI: Setelan keamanan dilonggarkan menjadi 'BLOCK_NONE'.
-        # PERINGATAN: Ini dapat menghasilkan konten yang tidak difilter.
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ]
-
-        generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 8192}
+        
+        # SOLUSI: Menaikkan batas output token secara signifikan
+        generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 32768}
 
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",
+            # MODEL TETAP SESUAI PERMINTAAN PENGGUNA
+            model_name="gemini-2.5-pro", 
             generation_config=generation_config,
             safety_settings=safety_settings
         )
@@ -179,20 +179,18 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         log("Sending storyboard prompt to Gemini API with file reference...")
         response = model.generate_content(prompt_parts, request_options={'timeout': 600})
 
-        # PENANGANAN ERROR LEBIH BAIK: Periksa kandidat dan alasan penghentian.
         if not response.candidates:
-            log(f"ERROR: Prompt diblokir oleh API. Feedback: {response.prompt_feedback}")
+            log(f"ERROR: Prompt was blocked by the API. Feedback: {response.prompt_feedback}")
             return None
 
         candidate = response.candidates[0]
         if candidate.finish_reason.name != "STOP":
-             log(f"ERROR: Respons dihentikan dengan alasan: {candidate.finish_reason.name}.")
+             log(f"ERROR: Response was stopped with reason: {candidate.finish_reason.name}.")
              if candidate.finish_reason.name == "SAFETY":
-                 log("Ini kemungkinan besar karena setelan keamanan. Konten file SRT mungkin telah ditandai.")
-                 log(f"Peringkat keamanan: {candidate.safety_ratings}")
+                 log("This is likely due to safety settings. The SRT file content may have been flagged.")
+                 log(f"Safety ratings: {candidate.safety_ratings}")
              return None
 
-        # Sekarang aman untuk mengakses response.text
         raw_response_text = response.text
 
         debug_json_path = pathlib.Path(output_folder) / "storyboard_output.txt"
@@ -211,6 +209,7 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         if uploaded_file:
             log(f"Deleting uploaded file from service: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
+
 
 def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
     def log(msg):
