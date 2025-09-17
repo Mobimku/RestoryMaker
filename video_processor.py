@@ -68,10 +68,16 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
     timeblock_clips = []
     for i, tb in enumerate(segment_data.get('source_timeblocks', [])):
         if stop_event.is_set(): return None
+
+        # SOLUSI: Ganti koma dengan titik pada timestamp untuk FFmpeg
+        start_time = tb['start'].replace(',', '.')
+        end_time = tb['end'].replace(',', '.')
+
         clip_path = segment_work_dir / f"tb_{i}.mp4"
-        command = f"ffmpeg -i \"{source_video_path}\" -ss {tb['start']} -to {tb['end']} -c copy \"{clip_path}\""
+        command = f"ffmpeg -i \"{source_video_path}\" -ss {start_time} -to {end_time} -c copy \"{clip_path}\""
+
         if not run_ffmpeg_command(command, **kwargs):
-            kwargs['progress_callback'](f"ERROR: Failed to cut timeblock {i} for {segment_label}")
+            kwargs['progress_callback'](f"ERROR: Gagal memotong timeblock {i} untuk {segment_label}")
             return None
         timeblock_clips.append(clip_path)
 
