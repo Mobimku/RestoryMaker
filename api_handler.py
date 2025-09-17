@@ -58,7 +58,11 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         ]
         generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 8192}
 
-        model = genai.GenerativeModel("gemini-2.5-pro", generation_config, safety_settings=safety_settings)
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-pro",
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
 
         system_prompt = PROMPT_FILE.read_text(encoding='utf-8') if PROMPT_FILE.exists() else "You are a helpful AI."
         system_prompt = system_prompt.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
