@@ -132,8 +132,10 @@ class App(ctk.CTk):
                 vo_lang = segment.get('vo_language', language_code)
                 output_path = temp_audio_dir / f"vo_{label}.mp3"
 
-                if not api_handler.generate_vo_audio(script, api_key, str(output_path), vo_lang, self.log_message):
-                    raise Exception(f"Gagal menghasilkan audio untuk segmen {label}")
+                audio_success = api_handler.generate_vo_audio(script, api_key, str(output_path), vo_lang, self.log_message)
+                if not audio_success:
+                    raise Exception(f"Gagal total saat menghasilkan audio untuk segmen '{label}'. Menghentikan proses.")
+
                 vo_audio_map[label] = str(output_path)
 
             final_path = video_processor.process_video(storyboard, self.mp4_path.get(), vo_audio_map, user_settings, self.stop_event, self.log_message)
