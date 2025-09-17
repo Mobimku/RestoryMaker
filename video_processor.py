@@ -8,6 +8,15 @@ import shutil
 import random
 import threading
 from ffmpeg_utils import run_ffmpeg_command, get_duration
+import math
+
+def _ts_to_seconds(ts: str) -> float:
+    try:
+        ts = (ts or "").strip().replace(',', '.')
+        h, m, s = ts.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    except Exception:
+        return 0.0
 
 def _apply_effects(clip_path, effects, output_path, **kwargs):
     """Applies a list of effects to a single clip using FFmpeg's filter_complex."""
@@ -34,16 +43,34 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
         audio_stream = "[a_main_vol]"
 
     if user_settings.get("bgm_path"):
-        inputs += f' -i "{user_settings["bgm_path"]}"'
+        bgm_path = user_settings["bgm_path"]
         bgm_vol = user_settings.get("bgm_volume", 0.1)
-        audio_filters.append(f"[1:a]volume={bgm_vol}[bgm]")
-        audio_filters.append(f"{audio_stream}[bgm]amix=inputs=2:duration=longest[a_out]")
-        audio_stream = "[a_out]"
+        bgm_segment = user_settings.get("bgm_segment", "")
+        timing = user_settings.get("bgm_timing")
 
-    if user_settings.get("black_bars_size", 0) > 0:
-        bar_size = user_settings["black_bars_size"]
-        video_filters.append(f"{video_stream}pad=iw:ih+{bar_size}*2:0:{bar_size}:color=black[v_out]")
-        video_stream = "[v_out]"
+        if bgm_segment and timing and "start_sec" in timing and "duration_sec" in timing:
+            # BGM hanya pada segmen tertentu: loop, trim ke durasi, lalu delay ke offset
+            inputs += f' -stream_loop -1 -i "{bgm_path}"'
+            start_ms = int(round(timing["start_sec"] * 1000))
+            duration_sec = max(0.0, float(timing["duration_sec"]))
+            audio_filters.append(
+                f"[1:a]atrim=0:{duration_sec},asetpts=PTS-STARTPTS,volume={bgm_vol},adelay={start_ms}|{start_ms}[bgm]"
+            )
+            audio_filters.append(f"{audio_stream}[bgm]amix=inputs=2:duration=longest[a_out]")
+            audio_stream = "[a_out]"
+        else:
+            # Global BGM sepanjang video (fallback lama)
+            inputs += f' -i "{bgm_path}"'
+            audio_filters.append(f"[1:a]volume={bgm_vol}[bgm]")
+            audio_filters.append(f"{audio_stream}[bgm]amix=inputs=2:duration=longest[a_out]")
+            audio_stream = "[a_out]"
+
+    # Selalu tambahkan letterbox (movie bars) default di atas & bawah sebagai overlay
+    # Menggunakan 12% tinggi frame untuk tiap bar.
+    video_filters.append(
+        f"{video_stream}drawbox=x=0:y=0:w=iw:h=ih*0.12:color=black:t=fill,drawbox=x=0:y=ih-ih*0.12:w=iw:h=ih*0.12:color=black:t=fill[v_out]"
+    )
+    video_stream = "[v_out]"
 
     if not video_filters and not audio_filters:
         shutil.copy(input_path, output_path)
@@ -68,8 +95,16 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
         # PERBAIKAN TIMESTAMP
         start_time = tb['start'].replace(',', '.')
         end_time = tb['end'].replace(',', '.')
+        # Hitung durasi untuk pemotongan yang lebih robust (re-encode)
+        start_sec = _ts_to_seconds(start_time)
+        end_sec = _ts_to_seconds(end_time)
+        duration = max(0.01, end_sec - start_sec)
         clip_path = segment_work_dir / f"tb_{i}.mp4"
-        command = f"ffmpeg -i \"{source_video_path}\" -ss {start_time} -to {end_time} -c copy \"{clip_path}\""
+        # Re-encode untuk menghindari error non-monotonic DTS / stream mismatch
+        command = (
+            f"ffmpeg -ss {start_sec:.3f} -t {duration:.3f} -i \"{source_video_path}\" "
+            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{clip_path}\""
+        )
         if not run_ffmpeg_command(command, **kwargs):
             kwargs['progress_callback'](f"ERROR: Gagal memotong timeblock {i} untuk {segment_label}")
             return None
@@ -126,7 +161,7 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
 def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, user_settings: dict, stop_event: threading.Event, progress_callback=None):
     base_dir = pathlib.Path(source_video_path).parent
     work_dir = base_dir / "temp_restory_work"
-    kwargs = {"progress_callback": progress_callback, "stop_event": stop_event}
+    kwargs = {"progress_callback": progress_callback}
 
     try:
         if work_dir.exists(): shutil.rmtree(work_dir)
@@ -134,6 +169,7 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
         progress_callback(f"Created temporary working directory at: {work_dir}")
 
         processed_segment_paths = []
+        segment_order = []
         selected_segments = user_settings.get("selected_segments", [])
 
         for segment_data in storyboard.get('segments', []):
@@ -148,6 +184,7 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
                 segment_path = _process_segment(segment_data, vo_path, source_video_path, work_dir, stop_event, **kwargs)
                 if segment_path:
                     processed_segment_paths.append(segment_path)
+                    segment_order.append(segment_label)
                     # **SOLUSI MANAJEMEN RUANG**
                     segment_work_dir = work_dir / segment_data['label']
                     if segment_work_dir.exists():
@@ -161,25 +198,76 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
         if stop_event.is_set() or not processed_segment_paths:
             raise InterruptedError("Processing stopped or no segments were completed.")
 
-        concat_video_path = work_dir / "concatenated.mp4"
-        if len(processed_segment_paths) > 1:
-            concat_list_path = work_dir / "final_concat_list.txt"
-            with open(concat_list_path, "w", encoding="utf-8") as f:
-                for p in processed_segment_paths: f.write(f"file '{p.resolve().as_posix()}'\n")
-            command = f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" -c copy \"{concat_video_path}\""
-            if not run_ffmpeg_command(command, **kwargs): raise Exception("Final concatenation failed.")
+        # Branch: concat all vs export per-segment
+        if user_settings.get("process_all", True):
+            concat_video_path = work_dir / "concatenated.mp4"
+            if len(processed_segment_paths) > 1:
+                concat_list_path = work_dir / "final_concat_list.txt"
+                with open(concat_list_path, "w", encoding="utf-8") as f:
+                    for p in processed_segment_paths: f.write(f"file '{p.resolve().as_posix()}'\n")
+                command = f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" -c copy \"{concat_video_path}\""
+                if not run_ffmpeg_command(command, **kwargs): raise Exception("Final concatenation failed.")
+            else:
+                if processed_segment_paths: shutil.copy(processed_segment_paths[0], concat_video_path)
+                else: raise Exception("No segments processed to create final video.")
+
+            if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
+
+            # Hitung timing BGM jika disetel untuk segmen tertentu
+            bgm_segment = user_settings.get("bgm_segment")
+            if user_settings.get("bgm_path") and bgm_segment and bgm_segment in segment_order:
+                idx = segment_order.index(bgm_segment)
+                start_sec = 0.0
+                for p in processed_segment_paths[:idx]:
+                    d = get_duration(str(p)) or 0.0
+                    start_sec += float(d)
+                vo_map = user_settings.get("_vo_audio_map") or {}
+                target_vo_path = vo_map.get(bgm_segment)
+                duration_sec = None
+                if target_vo_path:
+                    duration_sec = get_duration(target_vo_path)
+                if not duration_sec:
+                    duration_sec = get_duration(str(processed_segment_paths[idx]))
+                if duration_sec:
+                    user_settings["bgm_timing"] = {"start_sec": float(start_sec), "duration_sec": float(duration_sec)}
+
+            final_video_path = user_settings.get("output_path")
+            progress_callback("--- Applying final effects (BGM, Volume, etc.) ---")
+            if not _apply_final_effects(concat_video_path, final_video_path, user_settings, **kwargs):
+                raise Exception("Failed to apply final effects.")
+
+            return final_video_path
         else:
-            if processed_segment_paths: shutil.copy(processed_segment_paths[0], concat_video_path)
-            else: raise Exception("No segments processed to create final video.")
+            # Export per segment without concatenation
+            out_paths = []
+            out_dir = pathlib.Path(user_settings.get("output_path")).parent
+            base_stem = pathlib.Path(user_settings.get("output_path")).stem.replace("_recap", "")
+            vo_map = user_settings.get("_vo_audio_map") or {}
 
-        if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
+            for seg_label, seg_path in zip(segment_order, processed_segment_paths):
+                if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
+                per_out = out_dir / f"{base_stem}_{seg_label}.mp4"
+                # Per-segment BGM timing: if bgm configured for this seg, start at 0, duration = VO length or segment length
+                local_settings = dict(user_settings)
+                bgm_segment = user_settings.get("bgm_segment")
+                if user_settings.get("bgm_path") and bgm_segment == seg_label:
+                    duration_sec = None
+                    if vo_map.get(seg_label):
+                        duration_sec = get_duration(vo_map.get(seg_label))
+                    if not duration_sec:
+                        duration_sec = get_duration(str(seg_path))
+                    if duration_sec:
+                        local_settings["bgm_timing"] = {"start_sec": 0.0, "duration_sec": float(duration_sec)}
+                else:
+                    # remove timing so global BGM (whole segment) applies, or none
+                    local_settings.pop("bgm_timing", None)
 
-        final_video_path = user_settings.get("output_path")
-        progress_callback("--- Applying final effects (BGM, Volume, etc.) ---")
-        if not _apply_final_effects(concat_video_path, final_video_path, user_settings, **kwargs):
-            raise Exception("Failed to apply final effects.")
+                progress_callback(f"--- Applying final effects for segment '{seg_label}' ---")
+                if not _apply_final_effects(seg_path, str(per_out), local_settings, **kwargs):
+                    raise Exception(f"Failed to apply final effects for segment {seg_label}.")
+                out_paths.append(str(per_out))
 
-        return final_video_path
+            return out_paths
 
     except InterruptedError as e:
         progress_callback(f"STOPPED: {e}")

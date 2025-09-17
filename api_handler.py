@@ -1,9 +1,14 @@
 # api_handler.py
 import google.generativeai as genai
+import base64
 import json
 import pathlib
 import traceback
 import subprocess
+import urllib.request
+import urllib.error
+import time
+import re
 
 STORYBOARD_PROMPT_TEMPLATE = """
 # 🎬 Prompt: Storyboard Maker untuk Film Recap
@@ -167,13 +172,23 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
              return None
 
         raw_response_text = response.text
-        debug_json_path = pathlib.Path(output_folder) / "storyboard_output.txt"
-        with open(debug_json_path, "w", encoding="utf-8") as f: f.write(raw_response_text)
-        log(f"Menyimpan respons mentah Gemini ke {debug_json_path}")
+        # Simpan raw ke file debug (opsional)
+        raw_path = pathlib.Path(output_folder) / "storyboard_output_raw.txt"
+        try:
+            with open(raw_path, "w", encoding="utf-8") as f: f.write(raw_response_text)
+            log(f"Menyimpan respons mentah Gemini ke {raw_path}")
+        except Exception:
+            pass
 
+        # Bersihkan code fence lalu parse JSON, dan simpan ke .json
         response_text = raw_response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        log("Mem-parsing JSON...")
-        return json.loads(response_text)
+        log("Mem-parsing JSON dari respons Gemini...")
+        parsed = json.loads(response_text)
+        json_path = pathlib.Path(output_folder) / "storyboard_output.json"
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(parsed, jf, ensure_ascii=False, indent=2)
+        log(f"Menyimpan storyboard JSON ke {json_path}")
+        return parsed
     except Exception as e:
         log(f"Terjadi error saat memanggil Gemini API: {e}")
         log(traceback.format_exc())
@@ -183,33 +198,250 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
             log(f"Menghapus file yang diunggah dari layanan: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
 
-def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
+def generate_vo_audio(
+    vo_script: str,
+    api_key: str,
+    output_path: str,
+    language_code: str = "en-US",
+    voice_name: str = "",
+    progress_callback=None,
+    tts_device: str = "cpu",
+    voice_prompt_path: str = "",
+    speech_rate_wpm: int | None = None,
+    max_chunk_sec: int | None = None,
+    tts_backend: str = "gemini",
+):
     def log(msg):
         if progress_callback: progress_callback(msg)
 
+    # Pilih backend: gemini (default) atau lokal (Chatterbox)
+    if (tts_backend or "gemini").lower() in ("local", "chatterbox"):
+        try:
+            from tts_chatterbox import synthesize_with_chatterbox
+            lang = (language_code or "en").split('-')[0]
+            if progress_callback:
+                progress_callback(f"Membuat VO via Chatterbox (bahasa: {lang}, device: {tts_device})...")
+            ok = synthesize_with_chatterbox(
+                vo_script,
+                output_mp3_path=output_path,
+                language_code=lang,
+                progress_callback=progress_callback,
+                device=tts_device or "cpu",
+                audio_prompt_path=voice_prompt_path if voice_prompt_path else None,
+            )
+            return bool(ok)
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"FATAL: Chatterbox backend error: {e}")
+                progress_callback(traceback.format_exc())
+            return False
+
+    # Backend: Gemini 2.5 Flash Preview TTS dan pecah per ~3 menit
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-tts")
-        log(f"Meminta stream audio TTS dari Gemini (bahasa: {language_code})...")
+        import os, time, re, wave, tempfile
+        import api_manager as _am
+        genai.configure(api_key=api_key, transport='rest')
 
-        response = model.generate_content(vo_script)
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
 
-        if response.candidates and response.candidates[0].content.parts:
-            raw_audio_data = response.candidates[0].content.parts[0].inline_data.data
+        # Bagi teks menjadi chunk ~3 menit berdasarkan WPM jika tersedia; fallback ke panjang karakter
+        chunks = _split_text_for_tts_by_duration(vo_script, speech_rate_wpm or 160, max_sec=(max_chunk_sec or 180))
+        total = len(chunks)
+        log(f"Menyiapkan TTS Gemini Flash: {total} potongan (~3 menit per potong)...")
 
-            log(f"Menyimpan stream audio mentah sebagai file MP3 di: {output_path}")
-            with open(output_path, "wb") as out:
-                out.write(raw_audio_data)
+        # Temp folder untuk WAV chunk
+        tmp_dir = pathlib.Path(output_path).with_suffix('').with_name(pathlib.Path(output_path).stem + "_tts_chunks")
+        try:
+            if tmp_dir.exists():
+                for f in tmp_dir.glob("*"): f.unlink()
+            else:
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-            log(f"Berhasil membuat file MP3.")
-            return True
+        wav_paths = []
+        generation_config_base = {"response_modalities": ["AUDIO"]}
+        if voice_name:
+            generation_config_base["speech_config"] = {
+                "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}}
+            }
 
-        log("ERROR: Tidak ada data audio ditemukan dalam respons TTS.")
-        return False
+        # Prepare key rotation (exclude cooldown keys)
+        am = _am.APIManager()
+        for idx, chunk in enumerate(chunks, 1):
+            if not chunk.strip():
+                continue
+            _preview = chunk[:50].replace("\n", " ").replace("\r", " ")
+            log(f"[Gemini TTS] Chunk {idx}/{total}: {min(50, len(chunk))} chars preview → '{_preview}' ...")
+
+            # Rotate across available keys (skip cooldown). Prioritize provided api_key first if available
+            available_keys = am.get_available_keys()
+            if api_key and api_key in available_keys:
+                # put in front
+                available_keys = [api_key] + [k for k in available_keys if k != api_key]
+            elif api_key and not am.is_key_on_cooldown(api_key):
+                available_keys = [api_key] + available_keys
+            if not available_keys:
+                log("[Gemini TTS] ERROR: Tidak ada API key yang tersedia (semua cooldown).")
+                return False
+
+            response = None
+            last_exc = None
+            for ki, k in enumerate(available_keys, 1):
+                try:
+                    genai.configure(api_key=k, transport='rest')
+                    log(f"[Gemini TTS]   menggunakan API key #{ki}/{len(available_keys)}...")
+                    # Buat model baru agar binding client mengikuti key terbaru
+                    model_k = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
+                    response = model_k.generate_content(
+                        chunk,
+                        generation_config=generation_config_base,
+                        request_options={"timeout": 600}
+                    )
+                    # Success on this key
+                    break
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e)
+                    lower = msg.lower()
+                    if ("toomanyrequests" in msg or " 429" in msg or "quota" in lower):
+                        # Set 24h cooldown on this key and continue to next
+                        am.set_key_cooldown(k, 24*3600)
+                        log(f"[Gemini TTS]   key dibatasi (429/quota). Tandai cooldown 24 jam dan ganti key...")
+                        continue
+                    else:
+                        log(f"[Gemini TTS]   key gagal: {e}")
+                        continue
+            if response is None:
+                log(f"[Gemini TTS] ERROR: Semua API key gagal untuk chunk {idx}. Pesan terakhir: {last_exc}")
+                return False
+
+            if not response.candidates or not response.candidates[0].content.parts:
+                log(f"[Gemini TTS] WARNING: Tidak ada data audio pada chunk {idx}")
+                continue
+            part = response.candidates[0].content.parts[0]
+            if not hasattr(part, "inline_data") or not part.inline_data or not part.inline_data.data:
+                log(f"[Gemini TTS] WARNING: inline_data kosong pada chunk {idx}")
+                continue
+
+            raw = part.inline_data.data
+            audio_bytes = raw if isinstance(raw, (bytes, bytearray)) else base64.b64decode(raw)
+            wav_path = tmp_dir / f"chunk_{idx:03d}.wav"
+            # Tulis PCM 24kHz 16bit mono
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(audio_bytes)
+            wav_paths.append(wav_path)
+            log(f"[Gemini TTS] Chunk {idx}/{total} selesai: {wav_path.name}")
+
+        if not wav_paths:
+            log("FATAL: Tidak ada chunk audio yang berhasil dibuat.")
+            return False
+
+        # Gabungkan chunk WAV menjadi satu MP3 akhir untuk segmen ini
+        concat_list = tmp_dir / "concat.txt"
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for p in wav_paths:
+                f.write(f"file '{p.as_posix()}'\n")
+        cmd = f"ffmpeg -y -f concat -safe 0 -i \"{concat_list}\" -c:a libmp3lame -q:a 3 \"{output_path}\""
+        subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        log(f"[Gemini TTS] Penggabungan selesai → {output_path}")
+        return True
     except Exception as e:
-        log(f"FATAL: Terjadi error saat generasi TTS: {e}")
+        log(f"FATAL: Terjadi error saat generasi TTS Gemini: {e}")
         log(traceback.format_exc())
         return False
+
+
+def _split_text_for_tts_by_duration(text: str, wpm: int, max_sec: int = 180) -> list[str]:
+    """Split text by sentence, targeting chunks up to ~max_sec based on words per minute.
+    Falls back to char-based splitting if needed."""
+    import re
+    t = (text or "").strip()
+    if not t:
+        return [""]
+    # Rough calculation: usable words per second (assume 90% speaking, 10% pause)
+    words_per_sec = max(1.0, (wpm / 60.0) * 0.9)
+    max_words = int(words_per_sec * max_sec)
+    # Tokenize by sentences
+    parts = re.split(r"([.!?]\s)", t)
+    sentences = []
+    for i in range(0, len(parts), 2):
+        s = parts[i]
+        sep = parts[i+1] if i+1 < len(parts) else ""
+        sentences.append((s + sep).strip())
+    chunks = []
+    buf_words = 0
+    buf = []
+    for s in sentences:
+        if not s:
+            continue
+        sw = len(s.split())
+        if buf_words + sw <= max_words or not buf:
+            buf.append(s); buf_words += sw
+        else:
+            chunks.append(" ".join(buf).strip()); buf = [s]; buf_words = sw
+    if buf:
+        chunks.append(" ".join(buf).strip())
+    # Fallback if a single sentence is huge
+    fixed = []
+    for c in chunks:
+        if len(c.split()) > max_words * 1.5:
+            # split by chars roughly
+            mc = max(300, int(max_words * 6))  # rough char cap
+            for j in range(0, len(c), mc): fixed.append(c[j:j+mc])
+        else:
+            fixed.append(c)
+    return fixed
+
+
+def _generate_tts_via_rest(api_key: str, vo_script: str, language_code: str, voice_name: str, log):
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-tts:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": vo_script}]}],
+            "generationConfig": {
+                "responseMimeType": "audio/mp3",
+            }
+        }
+
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+        data = json.loads(raw.decode("utf-8"))
+        cand = (data.get("candidates") or [None])[0]
+        if not cand:
+            log("REST TTS: candidates kosong.")
+            return None
+        parts = cand.get("content", {}).get("parts", [])
+        if not parts:
+            log("REST TTS: parts kosong.")
+            return None
+        inline = parts[0].get("inline_data") or parts[0].get("inlineData")
+        if not inline or not inline.get("data"):
+            log("REST TTS: inline_data tidak ditemukan.")
+            return None
+        b64 = inline["data"]
+        try:
+            return base64.b64decode(b64)
+        except Exception:
+            # Jika bukan base64, kembalikan bytes langsung dari string
+            return bytes(b64, "utf-8")
+    except urllib.error.HTTPError as he:
+        log(f"REST TTS HTTPError: {he}")
+        try:
+            msg = he.read().decode("utf-8")
+            log(msg)
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        log(f"REST TTS error: {e}")
+        return None
 
 def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, log_func=print):
     """Membuat file MP3 hening sebagai placeholder jika terjadi error."""
@@ -219,3 +451,4 @@ def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, lo
         log_func(f"Membuat placeholder MP3 hening di {output_path}")
     except Exception as e:
         log_func(f"FFmpeg gagal membuat MP3 hening: {e}")
+
