@@ -1,19 +1,10 @@
 # api_handler.py
-# This module will handle all interactions with external APIs,
-# specifically the Google Gemini API for storyboard and speech generation.
-
 import google.generativeai as genai
-import os
 import json
 import pathlib
-import time
-import re
 import traceback
-import wave
-import struct
 import subprocess
 
-# The prompt is now embedded directly in the script.
 STORYBOARD_PROMPT_TEMPLATE = """
 # 🎬 Prompt: Storyboard Maker untuk Film Recap
 
@@ -139,47 +130,26 @@ SKEMA JSON KELUARAN:
 """
 
 def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, output_folder: str, language: str = "en", progress_callback=None):
-    """
-    Uploads the original SRT file, constructs a prompt using the file reference,
-    and returns the storyboard JSON from Gemini.
-    """
     def log(msg):
         if progress_callback: progress_callback(msg)
-        else: print(msg)
 
     uploaded_file = None
     try:
         genai.configure(api_key=api_key)
-
-        log(f"Uploading SRT file: {srt_path}...")
+        log(f"Mengunggah file SRT: {srt_path}...")
         uploaded_file = genai.upload_file(path=srt_path)
-        log(f"Successfully uploaded file: {uploaded_file.name}")
+        log(f"Berhasil mengunggah file: {uploaded_file.name}")
 
-        # SOLUSI: Setelan keamanan dilonggarkan menjadi 'BLOCK_NONE'.
-        # PERINGATAN: Ini dapat menghasilkan konten yang tidak difilter.
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ]
+        safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+        generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 32768}
 
-        generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40, "max_output_tokens": 8192}
-
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-pro",
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-
+        model = genai.GenerativeModel(model_name="gemini-2.5-pro", generation_config=generation_config, safety_settings=safety_settings)
         system_prompt = STORYBOARD_PROMPT_TEMPLATE.replace("{durasi_film}", str(film_duration // 60)).replace("{lang}", language)
-
         prompt_parts = [system_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file]
 
-        log("Sending storyboard prompt to Gemini API with file reference...")
+        log("Mengirim prompt storyboard ke Gemini API...")
         response = model.generate_content(prompt_parts, request_options={'timeout': 600})
 
-        # PENANGANAN ERROR LEBIH BAIK: Periksa kandidat dan alasan penghentian.
         if not response.candidates:
             log(f"ERROR: Prompt diblokir oleh API. Feedback: {response.prompt_feedback}")
             return None
@@ -192,7 +162,6 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
                  log(f"Peringkat keamanan: {candidate.safety_ratings}")
              return None
 
-        # Sekarang aman untuk mengakses response.text
         raw_response_text = response.text
 
         debug_json_path = pathlib.Path(output_folder) / "storyboard_output.txt"
@@ -202,7 +171,6 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         response_text = raw_response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         log("Parsing JSON...")
         return json.loads(response_text)
-
     except Exception as e:
         log(f"An error occurred calling Gemini API: {e}")
         log(traceback.format_exc())
@@ -212,44 +180,41 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
             log(f"Deleting uploaded file from service: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
 
-def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
+def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en", progress_callback=None):
     def log(msg):
         if progress_callback: progress_callback(msg)
-        else: print(msg)
+
     try:
         genai.configure(api_key=api_key)
-        client = genai.GenerativeModel(model_name="gemini-2.5-flash-preview-tts")
-        log(f"Requesting TTS from Gemini (voice: schedar)...")
-        response = client.generate_content(
-            contents=[vo_script],
-            generation_config={
-                "response_modalities": ["AUDIO"],
-                "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "schedar"}}}
-            }
-        )
+        model = genai.GenerativeModel(model_name="models/tts-1")
+        log(f"Meminta stream audio TTS dari Gemini (bahasa: {language_code})...")
+
+        response = model.generate_content(vo_script)
+
         if response.candidates and response.candidates[0].content.parts:
-            audio_data = response.candidates[0].content.parts[0].inline_data.data
-            with open(output_path, "wb") as out: out.write(audio_data)
-            log(f"Audio content written to file {output_path}")
+            raw_audio_data = response.candidates[0].content.parts[0].inline_data.data
+
+            log(f"Menyimpan stream audio mentah sebagai file MP3 di: {output_path}")
+            with open(output_path, "wb") as out:
+                out.write(raw_audio_data)
+
+            log(f"Berhasil membuat file MP3.")
             return True
-        log("No audio data found in TTS response.")
+
+        log("Tidak ada data audio ditemukan dalam respons TTS.")
         _create_silent_audio_placeholder(output_path, log_func=log)
         return True
     except Exception as e:
-        log(f"An error occurred during TTS generation: {e}")
+        log(f"Terjadi error saat generasi TTS: {e}")
         log(traceback.format_exc())
         _create_silent_audio_placeholder(output_path, log_func=log)
         return True
 
-def _create_silent_audio_placeholder(output_path: str, duration: float = 5.0, log_func=print):
+def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, log_func=print):
+    """Membuat file MP3 hening sebagai placeholder jika terjadi error."""
     try:
-        command = f'ffmpeg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t {duration} -c:a aac -y "{output_path}"'
+        command = f'ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t {duration} -c:a libmp3lame -q:a 9 "{output_path}"'
         subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-        log_func(f"Created silent audio placeholder of {duration}s at {output_path}")
+        log_func(f"Membuat placeholder MP3 hening di {output_path}")
     except Exception as e:
-        log_func(f"FFmpeg failed to create silent audio: {e}. Falling back to manual WAV creation.")
-        sample_rate = 44100; duration_samples = int(sample_rate * duration)
-        with wave.open(output_path, 'w') as wav_file:
-            wav_file.setnchannels(1); wav_file.setsampwidth(2); wav_file.setframerate(sample_rate)
-            for _ in range(duration_samples): wav_file.writeframes(struct.pack('<h', 0))
-        log_func("Manual WAV placeholder created.")
+        log_func(f"FFmpeg gagal membuat MP3 hening: {e}")

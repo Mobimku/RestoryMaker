@@ -81,7 +81,9 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
         for clip in timeblock_clips:
             f.write(f"file '{clip.resolve().as_posix()}'\n")
     seg_raw_path = segment_work_dir / "seg_raw.mp4"
-    if not run_ffmpeg_command(f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" -c copy \"{seg_raw_path}\"", **kwargs): return None
+    concat_command_1 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
+                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_raw_path}\"")
+    if not run_ffmpeg_command(concat_command_1, **kwargs): return None
 
     if stop_event.is_set(): return None
     cut_rules = segment_data.get('edit_rules', {})
@@ -113,7 +115,9 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
         for clip in effected_clips:
             f.write(f"file '{clip.resolve().as_posix()}'\n")
     seg_joined_path = segment_work_dir / "seg_joined.mp4"
-    if not run_ffmpeg_command(f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" -c copy \"{seg_joined_path}\"", **kwargs): return None
+    concat_command_2 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" "
+                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_joined_path}\"")
+    if not run_ffmpeg_command(concat_command_2, **kwargs): return None
 
     if stop_event.is_set(): return None
     vo_duration = get_duration(vo_audio_path)
