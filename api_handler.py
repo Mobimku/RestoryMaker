@@ -204,14 +204,12 @@ def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_c
             log(f"Berhasil membuat file MP3.")
             return True
 
-        log("Tidak ada data audio ditemukan dalam respons TTS.")
-        _create_silent_audio_placeholder(output_path, log_func=log)
-        return True
+        log("ERROR: Tidak ada data audio ditemukan dalam respons TTS.")
+        return False
     except Exception as e:
-        log(f"Terjadi error saat generasi TTS: {e}")
+        log(f"FATAL: Terjadi error saat generasi TTS: {e}")
         log(traceback.format_exc())
-        _create_silent_audio_placeholder(output_path, log_func=log)
-        return True
+        return False
 
 def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, log_func=print):
     """Membuat file MP3 hening sebagai placeholder jika terjadi error."""
