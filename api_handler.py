@@ -15,39 +15,21 @@ import subprocess
 
 PROMPT_FILE = pathlib.Path(__file__).parent / "prompt_storyboard.md"
 
-PROFANITY_FILTER = {
-    'heck': 'h*ck', 'darn': 'd*rn', 'damn': 'd*mn', 'bitch': 'b*tch',
-    'shit': 'sh*t', 'fuck': 'f*ck', 'asshole': 'a**hole', 'cunt': 'c*nt'
-}
-
 def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, output_folder: str, language: str = "en", progress_callback=None):
     """
-    Reads, sanitizes, and uploads an SRT file, then constructs a prompt
-    using the file reference and returns the storyboard JSON from Gemini.
+    Uploads the original SRT file, constructs a prompt using the file reference,
+    and returns the storyboard JSON from Gemini.
     """
     def log(msg):
         if progress_callback: progress_callback(msg)
         else: print(msg)
 
     uploaded_file = None
-    temp_srt_path = None
     try:
         genai.configure(api_key=api_key)
 
-        # 1. Read and Sanitize Content
-        log("Reading and sanitizing SRT file content...")
-        original_content = pathlib.Path(srt_path).read_text(encoding='utf-8')
-        sanitized_content = _sanitize_srt_content(original_content, log)
-
-        # 2. Save sanitized content to a temporary file
-        temp_srt_path = pathlib.Path(output_folder) / "temp_sanitized.srt"
-        with open(temp_srt_path, "w", encoding="utf-8") as f:
-            f.write(sanitized_content)
-        log(f"Saved sanitized SRT to temporary file: {temp_srt_path}")
-
-        # 3. Upload the sanitized temporary file
-        log(f"Uploading sanitized SRT file...")
-        uploaded_file = genai.upload_file(path=temp_srt_path)
+        log(f"Uploading SRT file: {srt_path}...")
+        uploaded_file = genai.upload_file(path=srt_path)
         log(f"Successfully uploaded file: {uploaded_file.name}")
 
         safety_settings = [
@@ -91,19 +73,9 @@ def get_storyboard_from_srt(srt_path: str, api_key: str, film_duration: int, out
         log(traceback.format_exc())
         return None
     finally:
-        # 4. Cleanup
         if uploaded_file:
             log(f"Deleting uploaded file from service: {uploaded_file.name}")
             genai.delete_file(name=uploaded_file.name)
-        if temp_srt_path and temp_srt_path.exists():
-            log(f"Deleting local temporary file: {temp_srt_path}")
-            os.remove(temp_srt_path)
-
-def _sanitize_srt_content(srt_content: str, log_func) -> str:
-    log_func("Applying profanity filter...")
-    for word, replacement in PROFANITY_FILTER.items():
-        srt_content = re.sub(r'\b' + re.escape(word) + r'\b', replacement, srt_content, flags=re.IGNORECASE)
-    return srt_content
 
 # --- The rest of the file is unchanged ---
 def generate_vo_audio(vo_script: str, api_key: str, output_path: str, language_code: str = "en-US", progress_callback=None):
