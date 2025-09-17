@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 
 class APIManager:
-    def __init__(self, filepath: str = 'api_keys.json'):
-        self.filepath = Path(filepath)
+    def __init__(self, filename: str = 'api_keys.json'):
+        # Store the config file in the user's home directory for cross-platform compatibility
+        # and to avoid permission errors.
+        self.filepath = Path.home() / filename
         self.keys = []
         self.load_keys()
 
