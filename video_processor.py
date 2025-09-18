@@ -10,6 +10,49 @@ import threading
 from ffmpeg_utils import run_ffmpeg_command, get_duration
 import math
 
+def _meta_flags() -> str:
+    # Safe container flags to improve playback/concat behavior
+    return "-movflags +faststart"
+
+def _pad_video_with_still(input_path: pathlib.Path, vid_len: float, target_len: float, work_dir: pathlib.Path, **kwargs):
+    """Pad video by freezing the last frame and concatenating a still clip.
+    Returns pathlib.Path to padded video or None on failure.
+    """
+    progress = kwargs.get("progress_callback") or (lambda *_: None)
+    pad_sec = max(0.0, float(target_len) - float(vid_len) + 0.02)
+    if pad_sec <= 0.0:
+        return input_path
+    try:
+        last_img = work_dir / "last_frame.jpg"
+        still_path = work_dir / "seg_pad_still.mp4"
+        orig_wo_path = work_dir / "seg_joined_wo.mp4"
+        padded_path = work_dir / "seg_joined_padded.mp4"
+        # 1) Extract last frame
+        start = max(0.0, float(vid_len) - 0.04)
+        cmd1 = (f"ffmpeg -y -ss {start:.3f} -i \"{input_path}\" -frames:v 1 \"{last_img}\"")
+        if not run_ffmpeg_command(cmd1, **kwargs):
+            return None
+        # 2) Build still video for pad duration (video only)
+        cmd2 = (f"ffmpeg -y -loop 1 -t {pad_sec:.3f} -i \"{last_img}\" -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{still_path}\"")
+        if not run_ffmpeg_command(cmd2, **kwargs):
+            return None
+        # 3) Make original segment video-only to match streams for concat
+        cmd3 = (f"ffmpeg -y -i \"{input_path}\" -an -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \"{orig_wo_path}\"")
+        if not run_ffmpeg_command(cmd3, **kwargs):
+            return None
+        # 4) Concat
+        concat_list = work_dir / "concat_pad_list.txt"
+        with open(concat_list, "w", encoding="utf-8") as f:
+            f.write(f"file '{_ffconcat_escape(orig_wo_path)}'\n")
+            f.write(f"file '{_ffconcat_escape(still_path)}'\n")
+        cmd4 = (f"ffmpeg -y -f concat -safe 0 -i \"{concat_list}\" -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{padded_path}\"")
+        if not run_ffmpeg_command(cmd4, **kwargs):
+            return None
+        progress(f"[Sync] Fallback padded by {pad_sec:.2f}s using last-frame freeze")
+        return padded_path
+    except Exception:
+        return None
+
 def _ts_to_seconds(ts: str) -> float:
     try:
         ts = (ts or "").strip().replace(',', '.')
@@ -386,10 +429,38 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
         for clip in effected_clips:
             f.write(f"file '{_ffconcat_escape(clip)}'\n")
     seg_joined_path = segment_work_dir / "seg_joined.mp4"
-        concat_command_2 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" "
-                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                        f"{_meta_flags()} \"{seg_joined_path}\"")
+    concat_command_2 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" "
+                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{seg_joined_path}\"")
     if not run_ffmpeg_command(concat_command_2, **kwargs): return None
+
+    # Pastikan panjang video >= panjang VO agar narasi tidak terpotong
+    try:
+        vo_len = get_duration(vo_audio_path) or 0.0
+        vid_len = get_duration(str(seg_joined_path)) or 0.0
+    except Exception:
+        vo_len = 0.0; vid_len = 0.0
+
+    seg_input_for_mix = seg_joined_path
+    # Jika video sedikit lebih pendek dari VO, pad dengan tpad (jika gagal, fallback freeze-frame)
+    if vo_len > 0 and vid_len + 0.05 < vo_len:
+        pad_sec = max(0.0, float(vo_len) - float(vid_len) + 0.02)
+        padded_path = segment_work_dir / "seg_joined_padded.mp4"
+        pad_cmd = (f"ffmpeg -y -i \"{seg_joined_path}\" -vf \"tpad=stop_mode=clone:stop_duration={pad_sec:.3f}\" "
+                   f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{padded_path}\"")
+        padded_ok = run_ffmpeg_command(pad_cmd, **kwargs)
+        if not padded_ok:
+            # Fallback robust method if tpad filter is unavailable
+            padded_fb = _pad_video_with_still(seg_joined_path, vid_len, vo_len, segment_work_dir, **kwargs)
+            if padded_fb:
+                seg_input_for_mix = padded_fb
+                padded_ok = True
+        if padded_ok:
+            seg_input_for_mix = padded_path if padded_path.exists() else seg_input_for_mix
+            try:
+                kwargs.get("progress_callback", lambda *_: None)(
+                    f"[Sync] Padded video by {pad_sec:.2f}s to match VO ({vo_len:.2f}s)")
+            except Exception:
+                pass
 
     if stop_event.is_set(): return None
     final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp4"
@@ -402,15 +473,17 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
                 cb(f"Applying VO gain x{main_vol:.2f} for segment '{segment_label}'")
             except Exception:
                 pass
+    # Gunakan durasi VO sebagai patokan total output (-t)
+    target_t = f"-t {float(vo_len):.3f}" if vo_len and vo_len > 0 else ""
     if main_vol and main_vol != 1.0:
-        command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
+        command = (f'ffmpeg -i \"{seg_input_for_mix}\" -i \"{vo_audio_path}\" '
                    f'-filter_complex "[1:a]volume={main_vol}[a1]" '
-                   f'-map 0:v -map "[a1]" -shortest -r 25 -c:v libx264 -preset veryfast -crf 23 '
-                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 \"{final_segment_path}\"')
+                   f'-map 0:v -map "[a1]" -r 25 -c:v libx264 -preset veryfast -crf 23 '
+                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 {target_t} \"{final_segment_path}\"')
     else:
-        command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
-                   f'-map 0:v -map 1:a -shortest -r 25 -c:v libx264 -preset veryfast -crf 23 '
-                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 \"{final_segment_path}\"')
+        command = (f'ffmpeg -i \"{seg_input_for_mix}\" -i \"{vo_audio_path}\" '
+                   f'-map 0:v -map 1:a -r 25 -c:v libx264 -preset veryfast -crf 23 '
+                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 {target_t} \"{final_segment_path}\"')
     if not run_ffmpeg_command(command, **kwargs): return None
     return final_segment_path
 
@@ -428,6 +501,7 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
         segment_order = []
         selected_segments = user_settings.get("selected_segments", [])
 
+        selected_set = set(selected_segments)
         for segment_data in storyboard.get('segments', []):
             if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
             segment_label = segment_data['label']
@@ -447,12 +521,19 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
                         progress_callback(f"--- Membersihkan file sementara untuk segmen: {segment_data['label']} ---")
                         shutil.rmtree(segment_work_dir)
                 else:
-                    progress_callback(f"Segment {segment_label} failed or was stopped."); break
+                    # Segmen dipilih dan gagal -> hentikan seluruh proses agar cerita utuh.
+                    raise Exception(f"Segment '{segment_label}' failed or was stopped.")
             else:
-                progress_callback(f"Warning: No voice-over audio found for segment '{segment_label}'. Skipping.")
+                # VO hilang untuk segmen yang dipilih -> ini error fatal.
+                raise Exception(f"No voice-over audio found for selected segment '{segment_label}'.")
 
         if stop_event.is_set() or not processed_segment_paths:
             raise InterruptedError("Processing stopped or no segments were completed.")
+
+        # Validasi: semua segmen terpilih harus berhasil diproses (cerita utuh)
+        if len(processed_segment_paths) != len(selected_segments):
+            missing = [s for s in selected_segments if s not in segment_order]
+            raise Exception(f"Incomplete rendering. Missing segments: {', '.join(missing)}")
 
         # Branch: concat all vs export per-segment
         if user_settings.get("process_all", True):
