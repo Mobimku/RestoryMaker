@@ -23,6 +23,7 @@ class App(ctk.CTk):
         self.stop_event = threading.Event()
 
         self.mp4_path = ctk.StringVar(); self.srt_path = ctk.StringVar(); self.output_folder = ctk.StringVar(); self.storyboard_path = ctk.StringVar()
+        self.youtube_url = ctk.StringVar(); self.download_video_var = ctk.BooleanVar(value=True)
         self.bgm_path = ctk.StringVar(); self.selected_api_key = ctk.StringVar()
 
         self.segment_order = ["Intro", "Rising", "Mid-conflict", "Climax", "Ending"]
@@ -45,10 +46,15 @@ class App(ctk.CTk):
         left_col = ctk.CTkScrollableFrame(self.editor_tab); left_col.grid(row=0, column=0, rowspan=3, padx=10, pady=10, sticky="nsew")
         right_col = ctk.CTkScrollableFrame(self.editor_tab); right_col.grid(row=0, column=1, rowspan=3, padx=10, pady=10, sticky="nsew")
         file_io_frame = ctk.CTkFrame(left_col); file_io_frame.pack(padx=10, pady=10, fill="x"); file_io_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(file_io_frame, text="MP4 File").grid(row=0, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.mp4_path, state="disabled").grid(row=0, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_mp4_file).grid(row=0, column=2, **self.grid_opts())
-        ctk.CTkLabel(file_io_frame, text="SRT File").grid(row=1, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.srt_path, state="disabled").grid(row=1, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_srt_file).grid(row=1, column=2, **self.grid_opts())
-        ctk.CTkLabel(file_io_frame, text="Output Folder").grid(row=2, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.output_folder, state="disabled").grid(row=2, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_output_folder).grid(row=2, column=2, **self.grid_opts())
-        ctk.CTkLabel(file_io_frame, text="Storyboard JSON (optional)").grid(row=3, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.storyboard_path, state="disabled").grid(row=3, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_storyboard_file).grid(row=3, column=2, **self.grid_opts())
+        # YouTube URL input (opsional)
+        ctk.CTkLabel(file_io_frame, text="YouTube URL (opsional)").grid(row=0, column=0, **self.grid_opts("w"));
+        ctk.CTkEntry(file_io_frame, textvariable=self.youtube_url).grid(row=0, column=1, **self.grid_opts("ew"));
+        ctk.CTkCheckBox(file_io_frame, text="Download video setelah SRT", variable=self.download_video_var).grid(row=0, column=2, padx=6, pady=6)
+
+        ctk.CTkLabel(file_io_frame, text="MP4 File").grid(row=1, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.mp4_path, state="disabled").grid(row=1, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_mp4_file).grid(row=1, column=2, **self.grid_opts())
+        ctk.CTkLabel(file_io_frame, text="SRT File").grid(row=2, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.srt_path, state="disabled").grid(row=2, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_srt_file).grid(row=2, column=2, **self.grid_opts())
+        ctk.CTkLabel(file_io_frame, text="Output Folder").grid(row=3, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.output_folder, state="disabled").grid(row=3, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_output_folder).grid(row=3, column=2, **self.grid_opts())
+        ctk.CTkLabel(file_io_frame, text="Storyboard JSON (optional)").grid(row=4, column=0, **self.grid_opts("w")); ctk.CTkEntry(file_io_frame, textvariable=self.storyboard_path, state="disabled").grid(row=4, column=1, **self.grid_opts("ew")); ctk.CTkButton(file_io_frame, text="Browse...", command=self._select_storyboard_file).grid(row=4, column=2, **self.grid_opts())
         # Perkecil log box agar panel kiri tidak terlalu panjang
         self.log_box = ctk.CTkTextbox(left_col, state="disabled", wrap="word", height=180); self.log_box.pack(padx=10, pady=10, fill="x")
         progress_frame = ctk.CTkFrame(left_col); progress_frame.pack(padx=10, pady=10, fill="x"); progress_frame.grid_columnconfigure(0, weight=1)
@@ -179,30 +185,31 @@ class App(ctk.CTk):
         api_key_to_use = self.api_manager.get_key()
         mp4 = self.mp4_path.get()
         srt = self.srt_path.get()
+        yt = self.youtube_url.get().strip()
         storyboard_json = self.storyboard_path.get()
         use_existing_storyboard = bool(storyboard_json and os.path.isfile(storyboard_json))
 
-        if not mp4 or not self.output_folder.get():
-            self.log_message("ERROR: Silakan pilih file MP4 dan Folder Output."); return
-        # Jika ada VO override dipilih, wajib storyboard json
-        any_override = any(self.vo_override_enabled[n].get() and self.vo_override_files[n].get() for n in self.segment_order)
-        if any_override and not use_existing_storyboard:
-            self.log_message("ERROR: Jika menggunakan VO Override, wajib memilih Storyboard JSON terlebih dahulu."); return
-        if not use_existing_storyboard:
-            if not srt:
-                self.log_message("ERROR: Tidak ada SRT. Pilih SRT atau berikan Storyboard JSON."); return
-            if not api_key_to_use:
-                self.log_message("ERROR: Tambahkan API Key untuk generate storyboard dari Gemini, atau berikan Storyboard JSON."); return
+        # Validasi minimal: Output folder wajib
+        if not self.output_folder.get():
+            self.log_message("ERROR: Silakan pilih Folder Output."); return
 
-        film_duration_sec = ffmpeg_utils.get_duration(mp4)
-        if not film_duration_sec: self.log_message(f"ERROR: Tidak dapat membaca durasi dari file video: {mp4}"); return
+        use_youtube = bool(yt)
+        if not use_youtube:
+            # Alur lama: butuh MP4; SRT atau Storyboard JSON
+            if not mp4:
+                self.log_message("ERROR: Silakan pilih file MP4 atau gunakan YouTube URL."); return
+            any_override = any(self.vo_override_enabled[n].get() and self.vo_override_files[n].get() for n in self.segment_order)
+            if any_override and not use_existing_storyboard:
+                self.log_message("ERROR: Jika menggunakan VO Override, wajib memilih Storyboard JSON terlebih dahulu."); return
+            if not use_existing_storyboard:
+                if not srt:
+                    self.log_message("ERROR: Tidak ada SRT. Pilih SRT atau berikan Storyboard JSON, atau gunakan YouTube URL."); return
+                if not api_key_to_use:
+                    self.log_message("ERROR: Tambahkan API Key untuk generate storyboard dari Gemini, atau berikan Storyboard JSON."); return
 
-        if not use_existing_storyboard:
-            self.log_message(f"Mendeteksi bahasa dari {os.path.basename(srt)}...")
-            detected_lang = language_detector.detect_language_from_srt(srt)
-            self.log_message(f"Bahasa terdeteksi: '{detected_lang}'.")
-        else:
-            detected_lang = "en"
+        # Lanjut ke thread dengan parameter YouTube jika ada
+        film_duration_sec = 0
+        detected_lang = "en"
 
         self.start_button.configure(state="disabled"); self.stop_button.configure(state="normal"); self.stop_event.clear()
         # Pass selected recap duration (int)
@@ -214,12 +221,91 @@ class App(ctk.CTk):
         if self.fast_storyboard_var is None:
             self.fast_storyboard_var = ctk.BooleanVar(value=True)
         model_choice = getattr(self, 'storyboard_model_var', None).get() if hasattr(self, 'storyboard_model_var') else "gemini-2.5-flash"
-        self.processing_thread = threading.Thread(target=self._processing_thread_target, args=(film_duration_sec, api_key_to_use, detected_lang, recap_minutes, model_choice)); self.processing_thread.start()
+        self.processing_thread = threading.Thread(target=self._processing_thread_target, args=(film_duration_sec, api_key_to_use, detected_lang, recap_minutes, model_choice, yt)); self.processing_thread.start()
 
     def _stop_processing(self): self.log_message("STOP signal sent..."); self.stop_event.set()
 
-    def _processing_thread_target(self, film_duration_sec, api_key, language_code, recap_minutes, model_choice):
+    def _processing_thread_target(self, film_duration_sec, api_key, language_code, recap_minutes, model_choice, youtube_url=""):
         try:
+            use_youtube = bool(youtube_url)
+            # Jika YouTube digunakan: coba ambil subtitle via yt-dlp dulu; jika tidak ada, transkrip via Gemini
+            if use_youtube:
+                # 1) Coba yt-dlp subtitle (json3/srv3/vtt/srt)
+                srt_path = None
+                yinfo = {}
+                try:
+                    self.log_message("Mencoba mengunduh subtitle dari YouTube (json3/srv3/vtt/srt)...")
+                    from youtube_utils import download_subtitles
+                    sub_path, sub_ext = download_subtitles(youtube_url, self.output_folder.get(), progress_callback=self.log_message)
+                    if sub_path:
+                        self.log_message(f"Subtitle ditemukan: {os.path.basename(sub_path)} ({sub_ext})")
+                        # Konversi ke SRT standar (tidak harus word-level)
+                        target_srt = str(Path(self.output_folder.get()) / "youtube_transcript_wordlevel.srt")
+                        ok = False
+                        if sub_ext == 'json3':
+                            from api_handler import _json3_to_srt
+                            ok = _json3_to_srt(sub_path, target_srt, log=self.log_message)
+                        elif sub_ext == 'srv3':
+                            from api_handler import _srv3_to_srt
+                            ok = _srv3_to_srt(sub_path, target_srt, log=self.log_message)
+                        elif sub_ext == 'vtt':
+                            from api_handler import _vtt_to_srt
+                            ok = _vtt_to_srt(sub_path, target_srt, log=self.log_message)
+                        elif sub_ext == 'srt':
+                            try:
+                                import shutil
+                                shutil.copyfile(sub_path, target_srt)
+                                ok = True
+                            except Exception:
+                                ok = False
+                        if ok:
+                            srt_path = target_srt
+                            self.log_message("Subtitle siap digunakan (word-level bila didukung).")
+                        else:
+                            self.log_message("Gagal konversi subtitle ke word-level SRT. Akan coba transkrip via Gemini.")
+                except Exception as e:
+                    self.log_message(f"Subtitle YouTube tidak tersedia atau gagal: {e}")
+
+                # 2) Fallback ke Gemini jika tidak ada
+                yt_info = {}
+                if not srt_path:
+                    self.log_message("Memulai transkripsi YouTube (word-level SRT) via Gemini...")
+                    from api_handler import transcribe_youtube_to_srt
+                    srt_path, yt_info = transcribe_youtube_to_srt(youtube_url, api_key, self.output_folder.get(), progress_callback=self.log_message)
+                    if not srt_path:
+                        raise Exception("Gagal membuat SRT dari YouTube.")
+                self.srt_path.set(srt_path)
+                # Deteksi bahasa dari SRT hasil
+                language_code = language_detector.detect_language_from_srt(srt_path)
+                self.log_message(f"Bahasa terdeteksi dari transkrip: '{language_code}'.")
+
+                # Download video jika diminta; jika tidak, kita akan coba ambil durasi dari metadata
+                mp4 = None
+                if self.download_video_var.get():
+                    try:
+                        self.log_message("Mengunduh video kualitas terbaik...")
+                        from youtube_utils import download_video_best
+                        mp4 = download_video_best(youtube_url, self.output_folder.get(), progress_callback=self.log_message)
+                        self.mp4_path.set(mp4)
+                    except Exception as e:
+                        raise Exception(f"Gagal mengunduh video: {e}")
+
+                # Durasi film: dari file jika ada, kalau tidak gunakan info yt
+                if mp4:
+                    dur = ffmpeg_utils.get_duration(mp4)
+                    if not dur:
+                        raise Exception(f"Tidak dapat membaca durasi dari video: {mp4}")
+                    film_duration_sec = dur
+                else:
+                    try:
+                        from youtube_utils import get_video_info
+                        yinfo = get_video_info(youtube_url) or {}
+                        film_duration_sec = int(yinfo.get("duration") or 0)
+                    except Exception:
+                        film_duration_sec = 0
+                    if not film_duration_sec:
+                        self.log_message("Peringatan: Durasi video tidak tersedia dari metadata. Sebaiknya aktifkan download video untuk akurasi.")
+
             selected_segments = [name for name, var in self.segment_vars.items() if var.get()]
             if not selected_segments: raise Exception("No segments selected for processing.")
 
@@ -301,6 +387,15 @@ class App(ctk.CTk):
                                 df.write(raw)
                             raise Exception(f"Format file storyboard tidak berisi JSON valid. Salinan mentah disimpan ke {dbg}")
             else:
+                # Non-YouTube path: pastikan durasi dan bahasa terdeteksi sebelum panggilan API
+                if not use_youtube:
+                    mp4 = self.mp4_path.get()
+                    film_duration_sec = ffmpeg_utils.get_duration(mp4)
+                    if not film_duration_sec:
+                        raise Exception(f"ERROR: Tidak dapat membaca durasi dari file video: {mp4}")
+                    self.log_message(f"Mendeteksi bahasa dari {os.path.basename(self.srt_path.get())}...")
+                    language_code = language_detector.detect_language_from_srt(self.srt_path.get())
+                    self.log_message(f"Bahasa terdeteksi: '{language_code}'.")
                 storyboard = api_handler.get_storyboard_from_srt(
                     self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code,
                     self.log_message, recap_minutes,
@@ -308,6 +403,11 @@ class App(ctk.CTk):
                     storyboard_model=model_choice
                 )
                 if not storyboard: raise Exception("Gagal mendapatkan storyboard dari API.")
+
+            # Jika tidak ada MP4 (mis. user tidak memilih download), hentikan setelah storyboard (tanpa render)
+            if not self.mp4_path.get():
+                self.log_message("Tidak ada file video MP4. Proses dihentikan setelah pembuatan storyboard. Aktifkan download video atau pilih file MP4 untuk melanjutkan render.")
+                return
 
             vo_audio_map = {}; temp_audio_dir = Path(self.output_folder.get()) / "temp_audio"; temp_audio_dir.mkdir(exist_ok=True)
             for segment in storyboard.get('segments', []):

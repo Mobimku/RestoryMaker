@@ -9,6 +9,8 @@ import urllib.request
 import urllib.error
 import time
 import re
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
 STORYBOARD_PROMPT_TEMPLATE = """
 # 🎬 Prompt: Storyboard Maker untuk Film Recap
@@ -26,12 +28,13 @@ Keluaran Anda HARUS mengikuti skema JSON di bawah ini.
 
 LANGKAH ANALISIS:
 1) Baca seluruh SRT. Identifikasi struktur naratif: Intro → Rising → Mid-conflict → Climax → Ending.
-2) Temukan momen penting (establishing context, inciting incident, turning points, confrontation, climax, resolution).
+2) Abaikan bumper atau introduction jika ada. Temukan momen penting (establishing context, inciting incident, turning points, confrontation, climax, resolution).
 3) Untuk setiap babak, pilih rentang timestamp SRT yang paling representatif (boleh discontinuous). Jumlah rentang tidak dibatasi angka tetap; cukup untuk menyusun BEATS klip 3-4 detik hingga menutup durasi VO segmen.
 4) Tulis recap ringkas per babak yang konsisten dengan target words_target per segmen (lihat PARAMETER KONKRIT); hindari patokan jumlah kalimat tetap.
 
 PENULISAN VO (WAJIB):
 - Kalimat pertama HARUS menjadi **HOOK punchy** sesuai konteks segmen (12–18 kata).
+- Gunakan teknik storrytelling Hook, Foreshadow, Story, Payoff tiap segment nya.
 - Gunakan kata-kata berbeda dengan makna sama; ubah struktur kalimat dari SRT.
 - Pertahankan SEMUA informasi penting (jangan buang detail inti).
 - Jangan menambahkan keterangan ekstra atau karakter baru.
@@ -51,10 +54,9 @@ PACING & WORD BUDGET (WAJIB):
 RENCANA VIDEO (per segmen):
 - Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
 - Total durasi hasil edit HARUS sama dengan durasi VO.
-- Pecah visual menjadi klip 3–4 detik secara BERURUTAN (bukan potongan kontinu panjang).
+- Pecah visual menjadi klip 3-4 detik secara BERURUTAN (bukan potongan kontinu panjang).
 - Urutan klip mengikuti urutan narasi/VO (ascending `at_ms`) dan menjaga progresi waktu sumber (gunakan `block_index` dan posisi di timeblock secara menaik) agar visual sinkron dengan VO.
-- Terapkan 0–2 efek per klip, pilih dari pool:
-  ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"]. Hindari zoom terus-menerus.
+- Efek visual akan ditambahkan otomatis saat proses editing. JANGAN keluarkan daftar efek dalam output.
 - Wajib menandai BEATS sebagai tulang visual (bone) untuk SETIAP klip 3–4 detik (tepat satu beat per klip):
   - Struktur beat (JSON): { "at_ms": <waktu_segm_ms>, "block_index": <idx_timeblock>, "src_at_ms": <posisi_ms_dalam_timeblock>, "src_length_ms": <durasi_klip_ms>, "note": "opsional" }
   - `src_length_ms` WAJIB berada di rentang 3000–4000 ms. Jika butuh durasi lebih panjang, pecah menjadi beberapa beat beruntun pada timeblock sama atau berikutnya — JANGAN membuat satu beat/klip kontinu > 4000 ms.
@@ -115,8 +117,6 @@ SKEMA JSON KELUARAN:
       ],
       "edit_rules": {
         "cut_length_sec": {"min": 3.0, "max": 4.0},
-        "effects_pool": ["crop_pan_light","zoom_light","hflip","contrast_plus","sat_plus","pip_blur_bg"],
-        "max_effects_per_clip": 2,
         "transition_every_sec": 25,
         "transition_type": "crossfade",
         "transition_duration_sec": 0.5
@@ -143,13 +143,12 @@ def get_storyboard_from_srt(
     def log(msg):
         if progress_callback: progress_callback(msg)
 
-    uploaded_file = None
+    uploaded_file = None  # deprecated single-file usage
+    uploaded_files: dict[str, object] = {}
     try:
         genai.configure(api_key=api_key)
-        # Selalu upload SRT karena merupakan file inti
-        log(f"Mengunggah file SRT: {srt_path}...")
-        uploaded_file = genai.upload_file(path=srt_path)
-        log(f"Berhasil mengunggah file: {uploaded_file.name}")
+        # Jangan upload di sini. Kita akan upload per-key saat memanggil model agar file dapat diakses oleh key tsb.
+        log("Menyiapkan unggah SRT per-key untuk akses file yang konsisten...")
 
         safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
         # Mode cepat menggunakan model flash dengan output JSON dan batas token lebih kecil
@@ -174,6 +173,20 @@ def get_storyboard_from_srt(
             generation_config=generation_config,
             safety_settings=safety_settings
         )
+        # Siapkan rotasi key untuk menghindari TooManyRequests/Quota
+        try:
+            import api_manager as _am
+            am = _am.APIManager()
+            available_keys = am.get_available_keys()
+            if api_key and api_key in available_keys:
+                available_keys = [api_key] + [k for k in available_keys if k != api_key]
+            elif api_key and not am.is_key_on_cooldown(api_key):
+                available_keys = [api_key] + available_keys
+            if not available_keys:
+                available_keys = [api_key] if api_key else []
+        except Exception:
+            am = None
+            available_keys = [api_key] if api_key else []
         # Hitung parameter VO konkret di luar prompt
         # Target total recap berdasarkan pilihan pengguna (default 22 menit)
         total_target_sec = int((recap_minutes or 22) * 60)
@@ -223,7 +236,7 @@ def get_storyboard_from_srt(
                 f"Bahasa VO: {language}\n"
                 "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
                 "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
-                "source_timeblocks, edit_rules (cut_length_sec 3-4, efek dari pool), dan beats (satu beat per klip 3-4 detik).\n"
+                "source_timeblocks, edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip 3-4 detik).\n"
                 "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
                 "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
                 f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
@@ -247,8 +260,6 @@ def get_storyboard_from_srt(
                 "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
                 "  \"edit_rules\": {\n"
                 "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
-                "    \"effects_pool\": [\"crop_pan_light\",\"zoom_light\",\"hflip\",\"contrast_plus\",\"sat_plus\",\"pip_blur_bg\"],\n"
-                "    \"max_effects_per_clip\": 2,\n"
                 "    \"transition_every_sec\": 25,\n"
                 "    \"transition_type\": \"crossfade\",\n"
                 "    \"transition_duration_sec\": 0.5\n"
@@ -273,26 +284,48 @@ def get_storyboard_from_srt(
         # Aktifkan PLANNER: bangun story per segmen untuk memastikan kepatuhan words_target (±10%)
         # Wrapper pemanggilan model dengan timeout adaptif + logging durasi
         def call_model(prompt, lbl: str = "", timeout_s: int | None = None):
-            try:
-                # Timeout lebih singkat untuk flash, lebih longgar untuk pro
-                if timeout_s is None:
-                    timeout_s = 120 if "flash" in (model_name or "") else 300
-                t0 = time.time()
-                resp = model.generate_content(prompt, request_options={'timeout': timeout_s})
-                dt = time.time() - t0
+            # Timeout lebih singkat untuk flash, lebih longgar untuk pro
+            if timeout_s is None:
+                timeout_s = 120 if "flash" in (model_name or "") else 300
+            last_exc = None
+            for ki, k in enumerate(available_keys, 1):
                 try:
-                    if lbl:
-                        log(f"[API] {lbl} selesai dalam {dt:.1f}s (timeout {timeout_s}s)")
-                except Exception:
-                    pass
-                return resp
-            except Exception as e:
-                try:
-                    if lbl:
-                        log(f"[API] {lbl} gagal: {e}")
-                except Exception:
-                    pass
-                raise
+                    genai.configure(api_key=k)
+                    model_k = genai.GenerativeModel(
+                        model_name=model_name,
+                        generation_config=generation_config,
+                        safety_settings=safety_settings
+                    )
+                    t0 = time.time()
+                    resp = model_k.generate_content(prompt, request_options={'timeout': timeout_s})
+                    dt = time.time() - t0
+                    try:
+                        if lbl:
+                            log(f"[API] {lbl} via key#{ki}/{len(available_keys)} selesai dalam {dt:.1f}s")
+                    except Exception:
+                        pass
+                    return resp
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e)
+                    low = msg.lower()
+                    if ('429' in msg) or ('toomanyrequests' in low) or ('quota' in low):
+                        if am:
+                            try:
+                                am.set_key_cooldown(k, 24*3600)
+                                log(f"[API] key dibatasi (429/quota). Tandai cooldown dan coba key berikutnya...")
+                            except Exception:
+                                pass
+                        time.sleep(1.5)
+                        continue
+                    else:
+                        try:
+                            log(f"[API] {lbl} gagal pada key#{ki}: {e}")
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
+                        continue
+            raise last_exc or RuntimeError("All API keys failed")
 
         # Selalu gunakan file upload untuk planner utama (tetap fallback ke excerpt jika gagal)
         use_upload = True
@@ -321,19 +354,48 @@ def get_storyboard_from_srt(
         tries_plan = 0; plan_resp = None
         while tries_plan < 3:
             tries_plan += 1
-            try:
-                log(f"Meminta planner timeblocks minimal... (try {tries_plan}/3)")
-                if use_upload and uploaded_file is not None:
-                    plan_resp = call_model([plan_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file], lbl=f"Planner(upload) try-{tries_plan}")
-                else:
-                    raise RuntimeError("skip-upload")
-                if plan_resp.candidates and plan_resp.candidates[0].finish_reason.name == "STOP":
-                    break
-                else:
-                    log("Planner tidak STOP, coba fallback excerpt...")
-            except Exception as e:
-                if str(e) != "skip-upload":
-                    log(f"Planner error: {e}")
+            log(f"Meminta planner timeblocks minimal... (try {tries_plan}/3)")
+            plan_resp = None
+            # Coba dengan upload file per-key agar tidak ada 403 (permission)
+            for ki, k in enumerate(available_keys, 1):
+                try:
+                    genai.configure(api_key=k)
+                    model_k = genai.GenerativeModel(
+                        model_name=model_name,
+                        generation_config=generation_config,
+                        safety_settings=safety_settings
+                    )
+                    uf = uploaded_files.get(k)
+                    if not uf:
+                        log(f"Mengunggah SRT untuk key #{ki}/{len(available_keys)}...")
+                        uf = genai.upload_file(path=srt_path)
+                        uploaded_files[k] = uf
+                        log(f"Upload sukses (key#{ki}): {uf.name}")
+                    plan_resp = model_k.generate_content([plan_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uf], request_options={'timeout': 120 if 'flash' in model_name else 300})
+                    if plan_resp.candidates and plan_resp.candidates[0].finish_reason.name == "STOP":
+                        log(f"Planner(upload) via key#{ki}/{len(available_keys)} OK")
+                        break
+                    else:
+                        log(f"Planner tidak STOP via key#{ki}. Coba key lain...")
+                        continue
+                except Exception as e:
+                    msg = str(e); low = msg.lower()
+                    if ('429' in msg) or ('toomanyrequests' in low) or ('quota' in low):
+                        try:
+                            am.set_key_cooldown(k, 24*3600)  # type: ignore[name-defined]
+                            log(f"Planner: key#{ki} 429/quota. Cooldown & coba key berikutnya...")
+                        except Exception:
+                            pass
+                        time.sleep(1.2)
+                        continue
+                    else:
+                        log(f"Planner error via key#{ki}: {e}")
+                        time.sleep(0.8)
+                        continue
+
+            if plan_resp and plan_resp.candidates and plan_resp.candidates[0].finish_reason.name == "STOP":
+                break
+
             # Fallback: gunakan excerpt teks SRT (tanpa upload file)
             excerpt_all = _build_srt_excerpt_all(srt_path, max_chars=8000)
             if excerpt_all:
@@ -345,12 +407,21 @@ def get_storyboard_from_srt(
                 except Exception as e2:
                     log(f"Planner fallback error: {e2}")
         if not plan_resp or not plan_resp.candidates or plan_resp.candidates[0].finish_reason.name != "STOP":
-            log("ERROR: Planner gagal setelah retry."); return None
-        plan_txt = plan_resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            plan_obj = json.loads(plan_txt)
-        except Exception as e:
-            log(f"ERROR parse JSON planner: {e}"); log(plan_txt[:500]); return None
+            log("ERROR: Planner gagal setelah retry. Menggunakan rencana minimal lokal dari SRT...")
+            plan_obj = _naive_plan_from_srt(srt_path)
+            if not plan_obj.get('segments'):
+                log("Gagal membuat rencana lokal minimal.")
+                return None
+        else:
+            plan_txt = plan_resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                plan_obj = json.loads(plan_txt)
+            except Exception as e:
+                log(f"ERROR parse JSON planner: {e}"); log(plan_txt[:500])
+                log("Coba rencana minimal lokal dari SRT...")
+                plan_obj = _naive_plan_from_srt(srt_path)
+                if not plan_obj.get('segments'):
+                    return None
 
         storyboard = {
             "film_meta": {"title": "", "duration_sec": int(film_duration)},
@@ -368,7 +439,7 @@ def get_storyboard_from_srt(
                 f"Bahasa VO: {language}\n"
                 "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
                 "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
-                "source_timeblocks, edit_rules (cut_length_sec 3-4, efek dari pool), dan beats (satu beat per klip 3-4 detik).\n"
+                "source_timeblocks, edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip 3-4 detik).\n"
                 "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
                 "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
                 f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
@@ -393,8 +464,6 @@ def get_storyboard_from_srt(
                 "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
                 "  \"edit_rules\": {\n"
                 "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
-                "    \"effects_pool\": [\"crop_pan_light\",\"zoom_light\",\"hflip\",\"contrast_plus\",\"sat_plus\",\"pip_blur_bg\"],\n"
-                "    \"max_effects_per_clip\": 2,\n"
                 "    \"transition_every_sec\": 25,\n"
                 "    \"transition_type\": \"crossfade\",\n"
                 "    \"transition_duration_sec\": 0.5\n"
@@ -450,9 +519,15 @@ def get_storyboard_from_srt(
         log(traceback.format_exc())
         return None
     finally:
-        if uploaded_file:
-            log(f"Menghapus file yang diunggah dari layanan: {uploaded_file.name}")
-            genai.delete_file(name=uploaded_file.name)
+        # Hapus semua file terunggah per-key
+        if uploaded_files:
+            for k, uf in list(uploaded_files.items()):
+                try:
+                    genai.configure(api_key=k)
+                    log(f"Menghapus file yang diunggah (key): {getattr(uf, 'name', '?')}")
+                    genai.delete_file(name=getattr(uf, 'name', None))
+                except Exception:
+                    pass
 
 def generate_vo_audio(
     vo_script: str,
@@ -478,7 +553,8 @@ def generate_vo_audio(
         import api_manager as _am
         genai.configure(api_key=api_key, transport='rest')
 
-        model = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
+        # Selaraskan dengan dokumentasi: gunakan model umum + response_mime_type audio/mp3
+        model = genai.GenerativeModel("gemini-2.5-flash")
 
         # Bagi teks menjadi chunk ~3 menit berdasarkan WPM jika tersedia; fallback ke panjang karakter
         chunks = _split_text_for_tts_by_duration(vo_script, speech_rate_wpm or 195, max_sec=(max_chunk_sec or 180))
@@ -496,11 +572,9 @@ def generate_vo_audio(
             pass
 
         wav_paths = []
-        generation_config_base = {"response_modalities": ["AUDIO"]}
+        generation_config_base = {"response_mime_type": "audio/mp3"}
         if voice_name:
-            generation_config_base["speech_config"] = {
-                "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}}
-            }
+            generation_config_base["speech_config"] = {"voice_name": voice_name}
 
         # Prepare key rotation (exclude cooldown keys)
         am = _am.APIManager()
@@ -528,7 +602,7 @@ def generate_vo_audio(
                     genai.configure(api_key=k, transport='rest')
                     log(f"[Gemini TTS]   menggunakan API key #{ki}/{len(available_keys)}...")
                     # Buat model baru agar binding client mengikuti key terbaru
-                    model_k = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
+                    model_k = genai.GenerativeModel("gemini-2.5-flash")
                     response = model_k.generate_content(
                         chunk,
                         generation_config=generation_config_base,
@@ -544,9 +618,11 @@ def generate_vo_audio(
                         # Set 24h cooldown on this key and continue to next
                         am.set_key_cooldown(k, 24*3600)
                         log(f"[Gemini TTS]   key dibatasi (429/quota). Tandai cooldown 24 jam dan ganti key...")
+                        time.sleep(1.5)
                         continue
                     else:
                         log(f"[Gemini TTS]   key gagal: {e}")
+                        time.sleep(1.0)
                         continue
             if response is None:
                 log(f"[Gemini TTS] ERROR: Semua API key gagal untuk chunk {idx}. Pesan terakhir: {last_exc}")
@@ -562,13 +638,10 @@ def generate_vo_audio(
 
             raw = part.inline_data.data
             audio_bytes = raw if isinstance(raw, (bytes, bytearray)) else base64.b64decode(raw)
-            wav_path = tmp_dir / f"chunk_{idx:03d}.wav"
-            # Tulis PCM 24kHz 16bit mono
-            with wave.open(str(wav_path), "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(24000)
-                wf.writeframes(audio_bytes)
+            # Simpan sebagai MP3 chunk karena response_mime_type=audio/mp3
+            wav_path = tmp_dir / f"chunk_{idx:03d}.mp3"
+            with open(wav_path, "wb") as outf:
+                outf.write(audio_bytes)
             wav_paths.append(wav_path)
             log(f"[Gemini TTS] Chunk {idx}/{total} selesai: {wav_path.name}")
 
@@ -687,6 +760,438 @@ def _create_silent_audio_placeholder(output_path: str, duration: float = 1.0, lo
         log_func(f"Membuat placeholder MP3 hening di {output_path}")
     except Exception as e:
         log_func(f"FFmpeg gagal membuat MP3 hening: {e}")
+
+
+def _json3_to_word_srt(json_path: str, srt_out: str, log=print) -> bool:
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        events = data.get('events') or []
+        idx = 1
+        out = []
+        def fmt(ms: int) -> str:
+            ms = max(0, int(ms))
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000; ms %= 60000
+            s = ms // 1000; ms %= 1000
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        for ev in events:
+            t0 = int(ev.get('tStartMs') or 0)
+            dur = int(ev.get('dDurationMs') or 0)
+            segs = ev.get('segs') or []
+            words = []
+            for sg in segs:
+                w = (sg.get('utf8') or '').strip()
+                if not w:
+                    continue
+                # Skip forced newline markers
+                if w in {'\n', '\r', '\r\n'}:
+                    continue
+                words.append((w, int(sg.get('tOffsetMs') or 0)))
+            if not words:
+                continue
+            # If segs include tOffsetMs, use t0 + offset; else distribute evenly
+            has_offsets = any(off for _, off in words)
+            if has_offsets:
+                for i, (w, off) in enumerate(words):
+                    st = t0 + off
+                    # next offset or end
+                    if i + 1 < len(words):
+                        et = t0 + words[i+1][1]
+                    else:
+                        et = t0 + dur if dur > 0 else st + 200
+                    if et <= st:
+                        et = st + 150
+                    out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", w, ""]) ; idx += 1
+            else:
+                # Evenly split duration among tokens; fallback 200ms each if dur unknown
+                per = int(dur / max(1, len(words))) if dur > 0 else 200
+                cur = t0
+                for (w, _) in words:
+                    st = cur
+                    et = st + per
+                    out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", w, ""]) ; idx += 1
+                    cur = et
+        if not out:
+            return False
+        with open(srt_out, 'w', encoding='utf-8', newline='\r\n') as f:
+            f.write('\r\n'.join(out))
+        return True
+    except Exception as e:
+        try:
+            log(f"JSON3->SRT error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _srv3_to_word_srt(xml_path: str, srt_out: str, log=print) -> bool:
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        # YouTube srv3 structure: <timedtext><body><p t="start" d="dur"><s t="offset">word</s>...</p>...
+        idx = 1
+        out = []
+        def fmt(ms: int) -> str:
+            ms = max(0, int(ms))
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000; ms %= 60000
+            s = ms // 1000; ms %= 1000
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        for p in root.findall('.//p'):
+            t0 = int(p.attrib.get('t', '0'))
+            dur = int(p.attrib.get('d', '0'))
+            s_nodes = p.findall('s')
+            if s_nodes:
+                # word-level offsets present
+                for i, s in enumerate(s_nodes):
+                    w = (s.text or '').strip()
+                    if not w:
+                        continue
+                    off = int(s.attrib.get('t', '0'))
+                    st = t0 + off
+                    if i + 1 < len(s_nodes):
+                        nxt = int(s_nodes[i+1].attrib.get('t', '0'))
+                        et = t0 + nxt
+                    else:
+                        et = t0 + dur if dur > 0 else st + 200
+                    if et <= st:
+                        et = st + 150
+                    out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", w, ""]) ; idx += 1
+            else:
+                # No <s>, split whole paragraph into words evenly
+                text = ''.join(p.itertext()).strip()
+                tokens = [t for t in text.split() if t]
+                if not tokens:
+                    continue
+                per = int(dur / max(1, len(tokens))) if dur > 0 else 200
+                cur = t0
+                for w in tokens:
+                    st = cur; et = st + per
+                    out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", w, ""]) ; idx += 1
+                    cur = et
+        if not out:
+            return False
+        with open(srt_out, 'w', encoding='utf-8', newline='\r\n') as f:
+            f.write('\r\n'.join(out))
+        return True
+    except Exception as e:
+        try:
+            log(f"SRV3->SRT error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _json3_to_srt(json_path: str, srt_out: str, log=print) -> bool:
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        events = data.get('events') or []
+        idx = 1
+        out = []
+        def fmt(ms: int) -> str:
+            ms = max(0, int(ms))
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000; ms %= 60000
+            s = ms // 1000; ms %= 1000
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        for ev in events:
+            t0 = int(ev.get('tStartMs') or 0)
+            dur = int(ev.get('dDurationMs') or 0)
+            segs = ev.get('segs') or []
+            words = []
+            for sg in segs:
+                w = (sg.get('utf8') or '').replace('\n', ' ').strip()
+                if w:
+                    words.append(w)
+            if not words:
+                continue
+            text = ' '.join(words).strip()
+            if not text:
+                continue
+            if dur <= 0:
+                dur = max(1000, 200 * len(words))
+            st = t0
+            et = t0 + dur
+            if et <= st:
+                et = st + 500
+            out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", text, ""]) ; idx += 1
+        if not out:
+            return False
+        with open(srt_out, 'w', encoding='utf-8', newline='\r\n') as f:
+            f.write('\r\n'.join(out))
+        return True
+    except Exception as e:
+        try:
+            log(f"JSON3->SRT(simple) error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _srv3_to_srt(xml_path: str, srt_out: str, log=print) -> bool:
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        idx = 1
+        out = []
+        def fmt(ms: int) -> str:
+            ms = max(0, int(ms))
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000; ms %= 60000
+            s = ms // 1000; ms %= 1000
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        for p in root.findall('.//p'):
+            t0 = int(p.attrib.get('t', '0'))
+            dur = int(p.attrib.get('d', '0'))
+            # Concatenate inner text
+            text = ''.join(p.itertext()).replace('\n', ' ').strip()
+            if not text:
+                continue
+            if dur <= 0:
+                tokens = [t for t in text.split() if t]
+                dur = max(1000, 200 * len(tokens))
+            st = t0; et = t0 + dur
+            if et <= st:
+                et = st + 500
+            out.extend([str(idx), f"{fmt(st)} --> {fmt(et)}", text, ""]) ; idx += 1
+        if not out:
+            return False
+        with open(srt_out, 'w', encoding='utf-8', newline='\r\n') as f:
+            f.write('\r\n'.join(out))
+        return True
+    except Exception as e:
+        try:
+            log(f"SRV3->SRT(simple) error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _vtt_to_srt(vtt_path: str, srt_out: str, log=print) -> bool:
+    try:
+        cmd = f"ffmpeg -y -i \"{vtt_path}\" \"{srt_out}\""
+        subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        return True
+    except Exception as e:
+        try:
+            log(f"VTT->SRT error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+# ============ NEW: YouTube transcription to word-level SRT via Gemini ============
+def transcribe_youtube_to_srt(
+    youtube_url: str,
+    api_key: str,
+    output_folder: str,
+    language: str = "auto",
+    progress_callback=None,
+    model_name: str = "gemini-2.5-flash",
+) -> tuple[str | None, dict]:
+    """Download audio from YouTube, transcribe with Gemini to word-level, write .srt.
+    Returns (srt_path, info_dict). info_dict may contain duration, title, lang.
+    """
+    def log(msg):
+        if progress_callback: progress_callback(msg)
+
+    info = {}
+    srt_path = None
+    try:
+        log(f"Transkripsi dari YouTube link (tanpa unduh awal): {youtube_url}")
+
+        genai.configure(api_key=api_key)
+        safety_settings = [{"category": c, "threshold": "BLOCK_NONE"} for c in [
+            "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"
+        ]]
+        # Siapkan rotasi key agar tidak menembak satu key terus-menerus
+        try:
+            import api_manager as _am
+            am = _am.APIManager()
+            available_keys = am.get_available_keys()
+            if api_key and api_key in available_keys:
+                available_keys = [api_key] + [k for k in available_keys if k != api_key]
+            elif api_key and not am.is_key_on_cooldown(api_key):
+                available_keys = [api_key] + available_keys
+            if not available_keys:
+                available_keys = [api_key] if api_key else []
+        except Exception:
+            am = None
+            available_keys = [api_key] if api_key else []
+
+        # Prompt SRT langsung agar menghindari parsing JSON yang rawan noise
+        prompt = (
+            "Buatkan transkrip dari video YouTube ini, dan beri timestamp word level untuk setiap kata.\n\n"
+            "Keluarkan HANYA file SRT valid (tanpa code fence, tanpa penjelasan).\n"
+            "Format SRT setiap cue:\n"
+            "<index>\n"
+            "HH:MM:SS,mmm --> HH:MM:SS,mmm\n"
+            "<teks satu kata (boleh termasuk tanda baca)>\n\n"
+            "Aturan:\n"
+            "- Gunakan link YouTube yang saya berikan sebagai sumber audio.\n"
+            "- Setiap kata menjadi satu cue terpisah.\n"
+            "- Gunakan milidetik (mmm). Pastikan end >= start.\n"
+            "- Jangan keluarkan teks selain isi SRT.\n"
+        )
+
+        # Bentuk payload seperti dokumentasi: parts = [file_data(file_uri=...), text(...)]
+        content_payload = None
+        try:
+            from google.generativeai import types as genai_types  # type: ignore
+            content_payload = genai_types.Content(parts=[
+                genai_types.Part(file_data=genai_types.FileData(file_uri=youtube_url)),
+                genai_types.Part(text=prompt),
+            ])
+        except Exception:
+            # Fallback dict-based content
+            content_payload = {
+                "parts": [
+                    {"file_data": {"file_uri": youtube_url}},
+                    {"text": prompt},
+                ]
+            }
+
+        t0 = time.time()
+        resp = None
+        last_exc = None
+        for ki, k in enumerate(available_keys, 1):
+            try:
+                # Inisialisasi client per-key
+                try:
+                    from google.generativeai import Client as _GenClient  # type: ignore
+                    client = _GenClient(api_key=k)
+                except Exception:
+                    client = None
+                genai.configure(api_key=k)
+                t0 = time.time()
+                if client is not None:
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=content_payload,
+                        generation_config={"temperature": 0.2, "response_mime_type": "text/plain"},
+                        safety_settings=safety_settings,
+                        request_options={"timeout": 300}
+                    )
+                else:
+                    model = genai.GenerativeModel(model_name=model_name,
+                        generation_config={"temperature": 0.2, "response_mime_type": "text/plain"},
+                        safety_settings=safety_settings)
+                    resp = model.generate_content(content_payload, request_options={"timeout": 300})
+                log(f"[API] Transkripsi selesai via key#{ki}/{len(available_keys)} dalam {time.time()-t0:.1f}s")
+                break
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                low = msg.lower()
+                if ('429' in msg) or ('toomanyrequests' in low) or ('quota' in low):
+                    if am:
+                        try:
+                            am.set_key_cooldown(k, 24*3600)
+                            log(f"[API] Transkrip: key#{ki} dibatasi (429/quota). Cooldown & coba key berikutnya...")
+                        except Exception:
+                            pass
+                    time.sleep(1.5)
+                    continue
+                else:
+                    log(f"[API] Transkrip gagal via key#{ki}: {e}")
+                    time.sleep(1.0)
+                    continue
+        if resp is None:
+            log(f"[API] Transkripsi gagal pada semua key: {last_exc}")
+            return None, info
+        txt = (resp.text or "").strip()
+        # Bersihkan code fence jika ada
+        if txt.startswith("```"):
+            if txt.lower().startswith("```srt"):
+                txt = txt[6:]
+            else:
+                txt = txt[3:]
+            if txt.endswith("```"):
+                txt = txt[:-3]
+            txt = txt.strip()
+
+        # Normalisasi SRT: pastikan penomoran berurutan, times valid, CRLF
+        import re as _re
+        def _parse_time(s: str) -> int | None:
+            m = _re.match(r"^(\d\d):(\d\d):(\d\d),(\d\d\d)$", s.strip())
+            if not m:
+                return None
+            h, mi, se, ms = map(int, m.groups())
+            return ((h*60+mi)*60+se)*1000 + ms
+        def _fmt_time_ms(ms: int) -> str:
+            ms = max(0, int(ms))
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000; ms %= 60000
+            s = ms // 1000; ms %= 1000
+            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        lines = [l.rstrip("\r") for l in txt.splitlines()]
+        cues = []
+        i = 0
+        time_re = _re.compile(r"^(\d\d:\d\d:\d\d,\d\d\d)\s+-->\s+(\d\d:\d\d:\d\d,\d\d\d)$")
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1; continue
+            # optional index line
+            idx_line = None
+            if line.isdigit():
+                idx_line = int(line)
+                i += 1
+                if i >= len(lines): break
+                line = lines[i].strip()
+            m = time_re.match(line)
+            if not m:
+                i += 1
+                continue
+            start_s, end_s = m.group(1), m.group(2)
+            i += 1
+            # collect text lines until blank
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                text_lines.append(lines[i].strip())
+                i += 1
+            # skip blank separator
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            text = " ".join(text_lines).strip()
+            if not text:
+                continue
+            st = _parse_time(start_s)
+            et = _parse_time(end_s)
+            if st is None or et is None:
+                continue
+            if et <= st:
+                et = st + 200
+            cues.append((st, et, text))
+
+        if not cues:
+            log("Transkrip SRT kosong atau tidak dikenali.")
+            return None, info
+
+        # Bangun ulang SRT dengan penomoran berurutan
+        cues.sort(key=lambda x: (x[0], x[1]))
+        out_lines = []
+        for n, (st, et, text) in enumerate(cues, start=1):
+            out_lines.append(str(n))
+            out_lines.append(f"{_fmt_time_ms(st)} --> {_fmt_time_ms(et)}")
+            out_lines.append(text)
+            out_lines.append("")
+
+        srt_path = str(Path(output_folder) / "youtube_transcript_wordlevel.srt")
+        with open(srt_path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\r\n".join(out_lines))
+        log(f"SRT word-level tersimpan: {srt_path}")
+
+        return srt_path, info
+    except Exception as e:
+        log(f"Transkripsi YouTube gagal: {e}")
+        log(traceback.format_exc())
+        return None, info
+    finally:
+        pass
 
 
 
