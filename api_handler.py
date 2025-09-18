@@ -146,6 +146,7 @@ def get_storyboard_from_srt(
     uploaded_file = None
     try:
         genai.configure(api_key=api_key)
+        # Selalu upload SRT karena merupakan file inti
         log(f"Mengunggah file SRT: {srt_path}...")
         uploaded_file = genai.upload_file(path=srt_path)
         log(f"Berhasil mengunggah file: {uploaded_file.name}")
@@ -269,34 +270,181 @@ def get_storyboard_from_srt(
             .replace("{climax_vo_sec}", str(secs_map["Climax"])) \
             .replace("{ending_vo_sec}", str(secs_map["Ending"]))
 
-        prompt_parts = [system_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file]
-        log("Mengirim prompt storyboard (single call) ke Gemini API...")
-        response = model.generate_content(prompt_parts, request_options={'timeout': 600})
+        # Aktifkan PLANNER: bangun story per segmen untuk memastikan kepatuhan words_target (±10%)
+        # Wrapper pemanggilan model dengan timeout adaptif + logging durasi
+        def call_model(prompt, lbl: str = "", timeout_s: int | None = None):
+            try:
+                # Timeout lebih singkat untuk flash, lebih longgar untuk pro
+                if timeout_s is None:
+                    timeout_s = 120 if "flash" in (model_name or "") else 300
+                t0 = time.time()
+                resp = model.generate_content(prompt, request_options={'timeout': timeout_s})
+                dt = time.time() - t0
+                try:
+                    if lbl:
+                        log(f"[API] {lbl} selesai dalam {dt:.1f}s (timeout {timeout_s}s)")
+                except Exception:
+                    pass
+                return resp
+            except Exception as e:
+                try:
+                    if lbl:
+                        log(f"[API] {lbl} gagal: {e}")
+                except Exception:
+                    pass
+                raise
 
-        if not response.candidates:
-            log(f"ERROR: Prompt diblokir oleh API. Feedback: {response.prompt_feedback}")
-            return None
-        candidate = response.candidates[0]
-        if candidate.finish_reason.name != "STOP":
-            log(f"ERROR: Respons dihentikan dengan alasan: {candidate.finish_reason.name}.")
-            return None
+        # Selalu gunakan file upload untuk planner utama (tetap fallback ke excerpt jika gagal)
+        use_upload = True
 
-        raw_response_text = response.text
-        raw_path = pathlib.Path(output_folder) / "storyboard_output_raw.txt"
+        # Planner untuk timeblocks minimal
+        plan_prompt = (
+            system_prompt + "\n\n# Planner Timeblocks (JSON saja)\n"
+            "Instruksi: Keluarkan JSON dengan array 'segments' berisi 5 item (Intro, Rising, Mid-conflict, Climax, Ending).\n"
+            "Setiap item wajib berisi: label, source_timeblocks (daftar objek {start,end,reason}).\n"
+            "Jangan keluarkan VO, beats, atau bidang lain. JSON minimal saja.\n"
+        )
+        # Planner dengan retry + fallback excerpt jika timeout
+        def _build_srt_excerpt_all(path: str, max_chars: int = 8000) -> str:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+                # Ringkas: ambil setiap N karakter secara berkala untuk meratakan sampling
+                if len(text) <= max_chars:
+                    return text
+                step = max(1, len(text) // max_chars)
+                sampled = text[::step][:max_chars]
+                return sampled
+            except Exception:
+                return ''
+
+        tries_plan = 0; plan_resp = None
+        while tries_plan < 3:
+            tries_plan += 1
+            try:
+                log(f"Meminta planner timeblocks minimal... (try {tries_plan}/3)")
+                if use_upload and uploaded_file is not None:
+                    plan_resp = call_model([plan_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uploaded_file], lbl=f"Planner(upload) try-{tries_plan}")
+                else:
+                    raise RuntimeError("skip-upload")
+                if plan_resp.candidates and plan_resp.candidates[0].finish_reason.name == "STOP":
+                    break
+                else:
+                    log("Planner tidak STOP, coba fallback excerpt...")
+            except Exception as e:
+                if str(e) != "skip-upload":
+                    log(f"Planner error: {e}")
+            # Fallback: gunakan excerpt teks SRT (tanpa upload file)
+            excerpt_all = _build_srt_excerpt_all(srt_path, max_chars=8000)
+            if excerpt_all:
+                try:
+                    log("Planner fallback dengan excerpt teks SRT...")
+                    plan_resp = call_model(plan_prompt + "\n\n## SRT EXCERPT (RINGKAS):\n" + excerpt_all, lbl=f"Planner(excerpt) try-{tries_plan}")
+                    if plan_resp.candidates and plan_resp.candidates[0].finish_reason.name == "STOP":
+                        break
+                except Exception as e2:
+                    log(f"Planner fallback error: {e2}")
+        if not plan_resp or not plan_resp.candidates or plan_resp.candidates[0].finish_reason.name != "STOP":
+            log("ERROR: Planner gagal setelah retry."); return None
+        plan_txt = plan_resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
-            with open(raw_path, "w", encoding="utf-8") as f: f.write(raw_response_text)
-            log(f"Menyimpan respons mentah Gemini ke {raw_path}")
-        except Exception:
-            pass
+            plan_obj = json.loads(plan_txt)
+        except Exception as e:
+            log(f"ERROR parse JSON planner: {e}"); log(plan_txt[:500]); return None
 
-        response_text = raw_response_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        log("Mem-parsing JSON dari respons Gemini...")
-        parsed = json.loads(response_text)
+        storyboard = {
+            "film_meta": {"title": "", "duration_sec": int(film_duration)},
+            "recap": {"intro": "", "rising": "", "mid_conflict": "", "climax": "", "ending": ""},
+            "segments": []
+        }
+
+        seg_map = {seg.get('label', ''): seg for seg in (plan_obj.get('segments') or [])}
+
+        # Per segmen: generate JSON lengkap + validasi words_actual ±10%, retry max 2x
+        def build_segment_prompt(label: str, vo_sec: int, wpm: int, words: int, ranges_sample: str) -> str:
+            return (
+                "# Segmen Storyboard (JSON saja)\n"
+                f"Label: {label}\n"
+                f"Bahasa VO: {language}\n"
+                "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
+                "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
+                "source_timeblocks, edit_rules (cut_length_sec 3-4, efek dari pool), dan beats (satu beat per klip 3-4 detik).\n"
+                "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
+                "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
+                f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
+                "SRT RINGKAS (relevan untuk segmen ini):\n" + ranges_sample + "\n\n"
+                "Format JSON yang diminta:\n"
+                "{\n"
+                f"  \"label\": \"{label}\",\n"
+                f"  \"vo_language\": \"{language}\",\n"
+                f"  \"target_vo_duration_sec\": {vo_sec},\n"
+                "  \"vo_script\": \"...\",\n"
+                "  \"vo_meta\": {\n"
+                f"    \"speech_rate_wpm\": {wpm},\n"
+                "    \"fill_ratio\": 0.90,\n"
+                f"    \"words_target\": {words},\n"
+                "    \"words_actual\": 0,\n"
+                "    \"sentences\": 0,\n"
+                "    \"commas\": 0,\n"
+                "    \"predicted_duration_sec\": 0.0,\n"
+                "    \"delta_sec\": 0.0,\n"
+                "    \"fit\": \"OK\"\n"
+                "  },\n"
+                "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
+                "  \"edit_rules\": {\n"
+                "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
+                "    \"effects_pool\": [\"crop_pan_light\",\"zoom_light\",\"hflip\",\"contrast_plus\",\"sat_plus\",\"pip_blur_bg\"],\n"
+                "    \"max_effects_per_clip\": 2,\n"
+                "    \"transition_every_sec\": 25,\n"
+                "    \"transition_type\": \"crossfade\",\n"
+                "    \"transition_duration_sec\": 0.5\n"
+                "  },\n"
+                "  \"beats\": [ {\"at_ms\": 0, \"block_index\": 0, \"src_at_ms\": 0, \"src_length_ms\": 3500, \"note\": \"...\"} ]\n"
+                "}\n"
+            )
+
+        def describe_ranges(ranges: list) -> str:
+            lines = []
+            for r in (ranges or [])[:8]:
+                lines.append(f"- {r.get('start','')} --> {r.get('end','')}: {r.get('reason','')}")
+            return "\n".join(lines)
+
+        for label in order:
+            ranges = (seg_map.get(label) or {}).get('source_timeblocks') or []
+            ranges_sample = describe_ranges(ranges)
+            tries = 0
+            while tries < 3:
+                tries += 1
+                prompt = build_segment_prompt(label, secs_map[label], wpm_map[label], words_map[label], ranges_sample)
+                log(f"Generate segmen: {label} (try {tries}/3, target {secs_map[label]}s, ~{words_map[label]} kata)")
+                resp = call_model(prompt, lbl=f"Segmen {label} try-{tries}")
+                if not resp.candidates or resp.candidates[0].finish_reason.name != "STOP":
+                    log(f"ERROR: gagal segmen {label} pada try {tries}")
+                    continue
+                txt = resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                try:
+                    seg_obj = json.loads(txt)
+                except Exception as e:
+                    log(f"ERROR parse segmen {label}: {e}")
+                    continue
+                # Validasi words_actual vs words_target (±10%)
+                vo = seg_obj.get('vo_script', '')
+                words_actual = len((vo or '').split())
+                target = words_map[label]
+                if target and abs(words_actual - target) / target > 0.10 and tries < 3:
+                    log(f"WARNING: segmen {label} words_actual={words_actual} target={target} (dev>10%). retry...")
+                    continue
+                storyboard['segments'].append(seg_obj)
+                break
+            else:
+                log(f"FATAL: segmen {label} gagal memenuhi kriteria.")
+                return None
+
         json_path = pathlib.Path(output_folder) / "storyboard_output.json"
         with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(parsed, jf, ensure_ascii=False, indent=2)
+            json.dump(storyboard, jf, ensure_ascii=False, indent=2)
         log(f"Menyimpan storyboard JSON ke {json_path}")
-        return parsed
+        return storyboard
     except Exception as e:
         log(f"Terjadi error saat memanggil Gemini API: {e}")
         log(traceback.format_exc())
