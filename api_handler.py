@@ -129,6 +129,235 @@ SKEMA JSON KELUARAN:
 }
 """
 
+# Prompt sederhana untuk mode cepat (Flash)
+STORYBOARD_PROMPT_SIMPLE = """
+Anda adalah AI untuk membuat storyboard film recap.
+Input: subtitle SRT film berdurasi {durasi_film} menit.
+Output: JSON storyboard.
+
+TUGAS UTAMA:
+1) Bagi film jadi 5 segmen: Intro, Rising, Mid-conflict, Climax, Ending
+2) Pilih timeblock penting dari SRT untuk setiap segmen (start-end + alasan singkat)
+3) Tulis VO (voice over) bahasa {lang} untuk setiap segmen sesuai durasi target
+
+TARGET DURASI (detik): Intro={intro_sec}, Rising={rising_sec}, Mid-conflict={mid_sec}, Climax={climax_sec}, Ending={ending_sec}
+
+FORMAT JSON OUTPUT:
+{{
+  "film_meta": {{"title": "", "duration_sec": {durasi_total_detik}}},
+  "segments": [
+    {{
+      "label": "Intro",
+      "vo_language": "{lang}",
+      "target_vo_duration_sec": {intro_sec},
+      "vo_script": "HOOK menarik di awal... (narasi ulang, ringkas, padat)",
+      "vo_meta": {{"speech_rate_wpm": 160, "fit": "OK"}},
+      "source_timeblocks": [
+        {{"start": "00:01:30,000", "end": "00:03:15,000", "reason": "opening scene"}}
+      ]
+    }}
+  ]
+}}
+
+ATURAN NARASI (SANGAT PENTING):
+- Mulai dengan hook menarik (12-18 kata)
+- Gunakan bahasa {lang}
+- Jangan copy dialog langsung, buat narasi ulang
+- Pertahankan SEMUA informasi penting (jangan buang detail inti)
+- Jangan menambahkan keterangan ekstra atau karakter baru
+- Sesuaikan panjang VO dengan target durasi (150-175 WPM)
+
+Keluarkan HANYA JSON tanpa penjelasan lain.
+"""
+
+def _ensure_storyboard_minimal_fields(sb: dict, film_duration: int, language: str, secs_map: dict | None = None) -> dict:
+    sb = sb or {}
+    fm = sb.get("film_meta") or {}
+    fm.setdefault("title", "")
+    fm.setdefault("duration_sec", int(film_duration))
+    sb["film_meta"] = fm
+    segs = sb.get("segments") or []
+    if not isinstance(segs, list):
+        segs = []
+    for seg in segs:
+        seg.setdefault("vo_language", language)
+        # Tidak menambahkan effects_pool apapun; efek dihandle di tahap editing
+        vr = seg.get("vo_meta") or {}
+        vr.setdefault("speech_rate_wpm", 160)
+        vr.setdefault("fit", "OK")
+        seg["vo_meta"] = vr
+        seg.setdefault("source_timeblocks", [{"start": "00:00:00,000", "end": "00:00:10,000", "reason": "auto"}])
+        if "target_vo_duration_sec" not in seg:
+            # default ringan 180s
+            seg["target_vo_duration_sec"] = 180
+    if not segs:
+        labels = ["Intro","Rising","Mid-conflict","Climax","Ending"]
+        if secs_map:
+            durs = [int(secs_map.get(lab, 180)) for lab in labels]
+        else:
+            durs = [180,480,360,360,240]
+        for lab, du in zip(labels, durs):
+            segs.append({
+                "label": lab,
+                "vo_language": language,
+                "target_vo_duration_sec": du,
+                "vo_script": f"Narasi {lab}.",
+                "vo_meta": {"speech_rate_wpm": 160, "fit": "OK"},
+                "source_timeblocks": [{"start": "00:00:00,000", "end": "00:00:10,000", "reason": lab}],
+            })
+    sb["segments"] = segs
+    return sb
+
+def get_storyboard_from_srt_fast(
+    srt_path: str,
+    api_key: str,
+    film_duration: int,
+    output_folder: str,
+    language: str = "en",
+    progress_callback=None,
+    recap_minutes: int | None = None,
+    timeout_s: int = 180,
+):
+    def log(msg):
+        if progress_callback: progress_callback(msg)
+
+    # Siapkan rotasi key
+    try:
+        import api_manager as _am
+        am = _am.APIManager()
+        available_keys = am.get_available_keys()
+        if api_key and api_key in available_keys:
+            available_keys = [api_key] + [k for k in available_keys if k != api_key]
+        elif api_key and not am.is_key_on_cooldown(api_key):
+            available_keys = [api_key] + available_keys
+        if not available_keys:
+            available_keys = [api_key] if api_key else []
+    except Exception:
+        am = None
+        available_keys = [api_key] if api_key else []
+
+    # Hitung porsi durasi per segmen berdasarkan recap_minutes (default 10 menit)
+    total_target_sec = int((recap_minutes or 10) * 60)
+    dist = {"Intro": 0.11, "Rising": 0.30, "Mid-conflict": 0.22, "Climax": 0.22, "Ending": 0.15}
+    secs_map = {k: max(30, int(round(v * total_target_sec))) for k, v in dist.items()}
+
+    sys_prompt = STORYBOARD_PROMPT_SIMPLE \
+        .replace("{durasi_film}", str(int(film_duration//60))) \
+        .replace("{durasi_total_detik}", str(int(film_duration))) \
+        .replace("{lang}", language) \
+        .replace("{intro_sec}", str(secs_map["Intro"])) \
+        .replace("{rising_sec}", str(secs_map["Rising"])) \
+        .replace("{mid_sec}", str(secs_map["Mid-conflict"])) \
+        .replace("{climax_sec}", str(secs_map["Climax"])) \
+        .replace("{ending_sec}", str(secs_map["Ending"]))
+
+    last_exc = None
+    uploaded_per_key = {}
+    for ki, k in enumerate(available_keys, 1):
+        try:
+            genai.configure(api_key=k)
+            log(f"[FAST] Upload SRT untuk key#{ki}/{len(available_keys)}...")
+            uf = genai.upload_file(path=srt_path)
+            uploaded_per_key[k] = uf
+            model = genai.GenerativeModel(
+                model_name="gemini-2.5-flash",
+                generation_config={
+                    "temperature": 0.5,
+                    "top_p": 0.8,
+                    "response_mime_type": "application/json",
+                },
+                safety_settings=[{"category": c, "threshold": "BLOCK_NONE"} for c in [
+                    "HARM_CATEGORY_HARASSMENT","HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT","HARM_CATEGORY_DANGEROUS_CONTENT"]]
+            )
+            t0 = time.time()
+            resp = model.generate_content([sys_prompt, "\n\n---\n\n## SRT FILE INPUT:\n", uf], request_options={"timeout": timeout_s})
+            log(f"[FAST] Storyboard via key#{ki} selesai dalam {time.time()-t0:.1f}s")
+            if not resp.candidates or resp.candidates[0].finish_reason.name != "STOP":
+                raise RuntimeError("FAST: candidate kosong atau tidak STOP")
+            txt = (resp.text or "").strip()
+            txt = txt.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            try:
+                data = json.loads(txt)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}$", txt)
+                if not m:
+                    raise
+                data = json.loads(m.group(0))
+            data = _ensure_storyboard_minimal_fields(data, film_duration, language, secs_map)
+            out = Path(output_folder) / "storyboard_output.json"
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            log(f"[FAST] Menyimpan storyboard JSON ke {out}")
+            return data
+        except Exception as e:
+            last_exc = e
+            msg = str(e); low = msg.lower()
+            if ("429" in msg) or ("toomanyrequests" in low) or ("quota" in low):
+                if am:
+                    try:
+                        am.set_key_cooldown(k, 24*3600)
+                        log(f"[FAST] key#{ki} quota/429. Cooldown & coba key lain...")
+                    except Exception:
+                        pass
+                time.sleep(1.2)
+                continue
+            elif ("deadline" in low) or ("504" in msg):
+                log(f"[FAST] key#{ki} timeout/504. Coba key lain...")
+                time.sleep(0.8)
+                continue
+            else:
+                log(f"[FAST] key#{ki} gagal: {e}")
+                time.sleep(0.6)
+                continue
+        finally:
+            try:
+                uf = uploaded_per_key.get(k)
+                if uf:
+                    genai.configure(api_key=k)
+                    genai.delete_file(name=getattr(uf, 'name', None))
+            except Exception:
+                pass
+
+    # Fallback: excerpt teks tanpa upload
+    try:
+        excerpt = ""
+        with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        if len(text) > 6000:
+            one = 2000
+            excerpt = text[:one] + "\n\n...\n\n" + text[len(text)//2:len(text)//2+one] + "\n\n...\n\n" + text[-one:]
+        else:
+            excerpt = text
+        for ki, k in enumerate(available_keys, 1):
+            try:
+                genai.configure(api_key=k)
+                model = genai.GenerativeModel(
+                    model_name="gemini-2.5-flash",
+                    generation_config={"temperature": 0.5, "top_p": 0.8, "response_mime_type": "application/json"},
+                    safety_settings=[{"category": c, "threshold": "BLOCK_NONE"} for c in [
+                        "HARM_CATEGORY_HARASSMENT","HARM_CATEGORY_HATE_SPEECH",
+                        "HARM_CATEGORY_SEXUALLY_EXPLICIT","HARM_CATEGORY_DANGEROUS_CONTENT"]]
+                )
+                resp = model.generate_content([sys_prompt, "\n\n## SRT EXCERPT:\n", excerpt], request_options={"timeout": timeout_s})
+                if not resp.candidates or resp.candidates[0].finish_reason.name != "STOP":
+                    raise RuntimeError("FAST(excerpt): gagal")
+                txt = (resp.text or "").strip()
+                txt = txt.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                data = json.loads(txt)
+                data = _ensure_storyboard_minimal_fields(data, film_duration, language, secs_map)
+                out = Path(output_folder) / "storyboard_output.json"
+                with open(out, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                log(f"[FAST] (excerpt) Menyimpan storyboard JSON ke {out}")
+                return data
+            except Exception as e:
+                log(f"[FAST] excerpt via key#{ki} gagal: {e}")
+                continue
+    except Exception as e:
+        log(f"[FAST] fallback excerpt error: {e}")
+    return None
+
 def get_storyboard_from_srt(
     srt_path: str,
     api_key: str,
@@ -553,8 +782,8 @@ def generate_vo_audio(
         import api_manager as _am
         genai.configure(api_key=api_key, transport='rest')
 
-        # Selaraskan dengan dokumentasi: gunakan model umum + response_mime_type audio/mp3
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        # Gunakan model TTS pratinjau yang mendukung audio output
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
 
         # Bagi teks menjadi chunk ~3 menit berdasarkan WPM jika tersedia; fallback ke panjang karakter
         chunks = _split_text_for_tts_by_duration(vo_script, speech_rate_wpm or 195, max_sec=(max_chunk_sec or 180))
@@ -572,9 +801,12 @@ def generate_vo_audio(
             pass
 
         wav_paths = []
-        generation_config_base = {"response_mime_type": "audio/mp3"}
+        generation_config_base = {"response_modalities": ["AUDIO"]}
         if voice_name:
-            generation_config_base["speech_config"] = {"voice_name": voice_name}
+            # Struktur voice_config untuk prebuilt voice (SDK pratinjau TTS)
+            generation_config_base["speech_config"] = {
+                "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}}
+            }
 
         # Prepare key rotation (exclude cooldown keys)
         am = _am.APIManager()
@@ -602,7 +834,7 @@ def generate_vo_audio(
                     genai.configure(api_key=k, transport='rest')
                     log(f"[Gemini TTS]   menggunakan API key #{ki}/{len(available_keys)}...")
                     # Buat model baru agar binding client mengikuti key terbaru
-                    model_k = genai.GenerativeModel("gemini-2.5-flash")
+                    model_k = genai.GenerativeModel("gemini-2.5-flash-preview-tts")
                     response = model_k.generate_content(
                         chunk,
                         generation_config=generation_config_base,
@@ -637,13 +869,23 @@ def generate_vo_audio(
                 continue
 
             raw = part.inline_data.data
+            mime = getattr(part.inline_data, "mime_type", None)
             audio_bytes = raw if isinstance(raw, (bytes, bytearray)) else base64.b64decode(raw)
-            # Simpan sebagai MP3 chunk karena response_mime_type=audio/mp3
-            wav_path = tmp_dir / f"chunk_{idx:03d}.mp3"
-            with open(wav_path, "wb") as outf:
-                outf.write(audio_bytes)
-            wav_paths.append(wav_path)
-            log(f"[Gemini TTS] Chunk {idx}/{total} selesai: {wav_path.name}")
+            # Simpan sesuai mime: jika mp3 -> .mp3, selain itu -> .wav (PCM/WAV container)
+            if mime and ("mp3" in mime or "mpeg" in mime):
+                out_path = tmp_dir / f"chunk_{idx:03d}.mp3"
+                with open(out_path, "wb") as outf:
+                    outf.write(audio_bytes)
+                wav_paths.append(out_path)
+            else:
+                out_path = tmp_dir / f"chunk_{idx:03d}.wav"
+                with wave.open(str(out_path), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    wf.writeframes(audio_bytes)
+                wav_paths.append(out_path)
+            log(f"[Gemini TTS] Chunk {idx}/{total} selesai: {out_path.name} ({mime or 'pcm'})")
 
         if not wav_paths:
             log("FATAL: Tidak ada chunk audio yang berhasil dibuat.")

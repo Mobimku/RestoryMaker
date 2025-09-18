@@ -95,7 +95,7 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
     # OPTIMASI KECEPATAN
     command = (f'ffmpeg {inputs} -filter_complex "{filter_complex}" '
                f'-map {video_map} -map {audio_map} -r 25 -c:v libx264 -preset veryfast '
-               f'-c:a aac -b:a 128k -ar 48000 -ac 2 {output_path}')
+               f'-c:a aac -b:a 128k -ar 48000 -ac 2 "{output_path}"')
     return run_ffmpeg_command(command, **kwargs)
 
 def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, stop_event, **kwargs):

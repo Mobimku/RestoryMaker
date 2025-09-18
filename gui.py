@@ -67,8 +67,8 @@ class App(ctk.CTk):
         # Pindahkan Recap Duration ke panel kiri agar panel kanan tidak terlalu panjang
         duration_frame = ctk.CTkFrame(left_col); duration_frame.pack(padx=10, pady=10, fill="x")
         ctk.CTkLabel(duration_frame, text="Recap Duration (minutes)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
-        self.recap_minutes_var = ctk.StringVar(value="22")
-        self.recap_minutes_menu = ctk.CTkOptionMenu(duration_frame, values=[str(x) for x in range(18, 26)], variable=self.recap_minutes_var)
+        self.recap_minutes_var = ctk.StringVar(value="10")
+        self.recap_minutes_menu = ctk.CTkOptionMenu(duration_frame, values=["5", "10", "15"], variable=self.recap_minutes_var)
         self.recap_minutes_menu.pack(fill="x", padx=10, pady=5)
         # Storyboard model selector
         model_frame = ctk.CTkFrame(left_col); model_frame.pack(padx=10, pady=10, fill="x")
@@ -76,21 +76,29 @@ class App(ctk.CTk):
         self.storyboard_model_var = ctk.StringVar(value="gemini-2.5-flash")
         self.storyboard_model_menu = ctk.CTkOptionMenu(model_frame, values=["gemini-2.5-flash", "gemini-2.5-pro"], variable=self.storyboard_model_var)
         self.storyboard_model_menu.pack(fill="x", padx=10, pady=5)
+        # Storyboard language selection (VO/script output language)
+        sb_lang_frame = ctk.CTkFrame(left_col); sb_lang_frame.pack(padx=10, pady=10, fill="x")
+        ctk.CTkLabel(sb_lang_frame, text="Storyboard Language", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
+        self.story_lang_var = ctk.StringVar(value="auto")
+        sb_lang_values = [
+            "auto","ar","da","de","el","en","es","fi","fr","he","hi","it","ja","ko","ms","nl","no","pl","pt","ru","sv","sw","tr","zh","id"
+        ]
+        self.story_lang_menu = ctk.CTkOptionMenu(sb_lang_frame, values=sb_lang_values, variable=self.story_lang_var)
+        self.story_lang_menu.pack(fill="x", padx=10, pady=5)
+        # Subtitle language preference removed; auto-detect/priority handled internally
         audio_frame = ctk.CTkFrame(right_col); audio_frame.pack(padx=10, pady=10, fill="x", pady_=(10,10))
         ctk.CTkLabel(audio_frame, text="Audio Settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10)
         ctk.CTkLabel(audio_frame, text="Main VO Volume (%)").pack(anchor="w", padx=10, pady=(10, 0))
         self.main_vol_slider = ctk.CTkSlider(audio_frame, from_=0, to=300); self.main_vol_slider.pack(fill="x", padx=10, pady=5); self.main_vol_slider.set(100)
-        # Voice name untuk TTS
-        ctk.CTkLabel(audio_frame, text="Voice Name (opsional)").pack(anchor="w", padx=10, pady=(10, 0))
+        # Voice (prebuilt) dropdown + custom entry
+        ctk.CTkLabel(audio_frame, text="Voice (prebuilt)").pack(anchor="w", padx=10, pady=(10, 0))
+        self.voice_choice_var = ctk.StringVar(value="(default)")
+        voice_values = ["(default)", "Puck", "Charon", "Aoede", "Fenrir", "Kore", "Luna", "Orpheus", "Remy", "Solis", "Custom..."]
+        self.voice_menu = ctk.CTkOptionMenu(audio_frame, values=voice_values, variable=self.voice_choice_var, command=self._on_voice_choice_changed)
+        self.voice_menu.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(audio_frame, text="Voice Name (opsional)").pack(anchor="w", padx=10, pady=(6, 0))
         self.voice_name_entry = ctk.CTkEntry(audio_frame); self.voice_name_entry.pack(fill="x", padx=10, pady=5)
-        # TTS Language override
-        ctk.CTkLabel(audio_frame, text="TTS Language").pack(anchor="w", padx=10, pady=(10, 0))
-        self.tts_lang_var = ctk.StringVar(value="auto")
-        tts_lang_values = [
-            "auto","ar","da","de","el","en","es","fi","fr","he","hi","it","ja","ko","ms","nl","no","pl","pt","ru","sv","sw","tr","zh","id"
-        ]
-        self.tts_lang_menu = ctk.CTkOptionMenu(audio_frame, values=tts_lang_values, variable=self.tts_lang_var)
-        self.tts_lang_menu.pack(fill="x", padx=10, pady=5)
+        # TTS language mengikuti storyboard (vo_language); tidak ada override di UI
         # TTS Device (diabaikan untuk Gemini; sembunyikan opsi)
         self.tts_device_var = ctk.StringVar(value="cpu")
         # Voice Prompt Audio dihapus (tidak diperlukan)
@@ -216,7 +224,7 @@ class App(ctk.CTk):
         try:
             recap_minutes = int(self.recap_minutes_var.get())
         except Exception:
-            recap_minutes = 22
+            recap_minutes = 10
         self.fast_storyboard_var = getattr(self, 'fast_storyboard_var', None)
         if self.fast_storyboard_var is None:
             self.fast_storyboard_var = ctk.BooleanVar(value=True)
@@ -224,6 +232,24 @@ class App(ctk.CTk):
         self.processing_thread = threading.Thread(target=self._processing_thread_target, args=(film_duration_sec, api_key_to_use, detected_lang, recap_minutes, model_choice, yt)); self.processing_thread.start()
 
     def _stop_processing(self): self.log_message("STOP signal sent..."); self.stop_event.set()
+
+    def _on_voice_choice_changed(self, choice: str):
+        try:
+            val = choice or self.voice_choice_var.get()
+            if val in ("(default)", "Custom..."):
+                # Allow manual typing
+                self.voice_name_entry.configure(state="normal")
+                if val == "(default)":
+                    # clear to use model default
+                    self.voice_name_entry.delete(0, 'end')
+            else:
+                # Predefined voice: fill and lock
+                self.voice_name_entry.configure(state="normal")
+                self.voice_name_entry.delete(0, 'end')
+                self.voice_name_entry.insert(0, val)
+                self.voice_name_entry.configure(state="disabled")
+        except Exception:
+            pass
 
     def _processing_thread_target(self, film_duration_sec, api_key, language_code, recap_minutes, model_choice, youtube_url=""):
         try:
@@ -236,6 +262,7 @@ class App(ctk.CTk):
                 try:
                     self.log_message("Mencoba mengunduh subtitle dari YouTube (json3/srv3/vtt/srt)...")
                     from youtube_utils import download_subtitles
+                    # Use internal default preference (id,id-*,en,en-*)
                     sub_path, sub_ext = download_subtitles(youtube_url, self.output_folder.get(), progress_callback=self.log_message)
                     if sub_path:
                         self.log_message(f"Subtitle ditemukan: {os.path.basename(sub_path)} ({sub_ext})")
@@ -275,9 +302,16 @@ class App(ctk.CTk):
                     if not srt_path:
                         raise Exception("Gagal membuat SRT dari YouTube.")
                 self.srt_path.set(srt_path)
-                # Deteksi bahasa dari SRT hasil
+                # Deteksi bahasa dari SRT hasil (sebagai fallback jika 'auto')
                 language_code = language_detector.detect_language_from_srt(srt_path)
-                self.log_message(f"Bahasa terdeteksi dari transkrip: '{language_code}'.")
+                # Override jika user memilih storyboard language tertentu
+                try:
+                    chosen_story_lang = self.story_lang_var.get().strip().lower() if self.story_lang_var else "auto"
+                    if chosen_story_lang and chosen_story_lang != "auto":
+                        language_code = chosen_story_lang
+                except Exception:
+                    pass
+                self.log_message(f"Storyboard language: '{language_code}'.")
 
                 # Download video jika diminta; jika tidak, kita akan coba ambil durasi dari metadata
                 mp4 = None
@@ -387,21 +421,36 @@ class App(ctk.CTk):
                                 df.write(raw)
                             raise Exception(f"Format file storyboard tidak berisi JSON valid. Salinan mentah disimpan ke {dbg}")
             else:
-                # Non-YouTube path: pastikan durasi dan bahasa terdeteksi sebelum panggilan API
+                # Non-YouTube path: pastikan durasi, lalu tentukan bahasa storyboard (pilihan user override deteksi)
                 if not use_youtube:
                     mp4 = self.mp4_path.get()
                     film_duration_sec = ffmpeg_utils.get_duration(mp4)
                     if not film_duration_sec:
                         raise Exception(f"ERROR: Tidak dapat membaca durasi dari file video: {mp4}")
-                    self.log_message(f"Mendeteksi bahasa dari {os.path.basename(self.srt_path.get())}...")
-                    language_code = language_detector.detect_language_from_srt(self.srt_path.get())
-                    self.log_message(f"Bahasa terdeteksi: '{language_code}'.")
-                storyboard = api_handler.get_storyboard_from_srt(
-                    self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code,
-                    self.log_message, recap_minutes,
-                    fast_mode=(model_choice == "gemini-2.5-flash"),
-                    storyboard_model=model_choice
-                )
+                    # Deteksi hanya jika 'auto'
+                    try:
+                        chosen_story_lang = self.story_lang_var.get().strip().lower() if self.story_lang_var else "auto"
+                    except Exception:
+                        chosen_story_lang = "auto"
+                    if chosen_story_lang == "auto":
+                        self.log_message(f"Mendeteksi bahasa dari {os.path.basename(self.srt_path.get())}...")
+                        language_code = language_detector.detect_language_from_srt(self.srt_path.get())
+                    else:
+                        language_code = chosen_story_lang
+                    self.log_message(f"Storyboard language: '{language_code}'.")
+                # Gunakan mode cepat jika memilih model Flash
+                if model_choice == "gemini-2.5-flash":
+                    storyboard = api_handler.get_storyboard_from_srt_fast(
+                        self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code,
+                        self.log_message, recap_minutes=recap_minutes, timeout_s=180
+                    )
+                else:
+                    storyboard = api_handler.get_storyboard_from_srt(
+                        self.srt_path.get(), api_key, int(film_duration_sec), self.output_folder.get(), language_code,
+                        self.log_message, recap_minutes,
+                        fast_mode=(model_choice == "gemini-2.5-flash"),
+                        storyboard_model=model_choice
+                    )
                 if not storyboard: raise Exception("Gagal mendapatkan storyboard dari API.")
 
             # Jika tidak ada MP4 (mis. user tidak memilih download), hentikan setelah storyboard (tanpa render)
@@ -431,10 +480,8 @@ class App(ctk.CTk):
                 # Coba rotasi semua API key yang tersimpan jika terjadi quota/429
                 keys = self.api_manager.get_keys() or [api_key]
                 audio_success = False
-                # Tentukan bahasa TTS final dari dropdown (override) atau auto
-                selected_tts_lang = self.tts_lang_var.get().strip().lower() if self.tts_lang_var else "auto"
+                # Bahasa TTS mengikuti storyboard (vo_language)
                 final_tts_lang = vo_lang
-                if selected_tts_lang and selected_tts_lang != "auto": final_tts_lang = selected_tts_lang
                 # Baca konfigurasi chunk durasi (detik)
                 try:
                     max_chunk_sec = int(self.tts_chunk_entry.get().strip()) if self.tts_chunk_entry.get().strip() else 180

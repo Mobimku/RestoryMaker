@@ -149,7 +149,8 @@ def download_subtitles(
     except Exception as e:
         raise RuntimeError("yt-dlp not installed. Please install it to use YouTube features.") from e
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    langs = languages or ["id", "en", "en-*", "id-*", "en-orig"]
+    # Prepare preferred languages; default prefers id then en
+    langs = languages or ["id", "id-*", "en", "en-*"]
     ydl_opts = _make_opts(output_dir, out_tmpl="%(title)s.%(ext)s")
     ydl_opts.update({
         "skip_download": True,
