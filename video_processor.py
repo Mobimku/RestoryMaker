@@ -305,84 +305,111 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
                 pass
         if not selected:
             return None
-    else:
-        # Fallback: timeblocks → join → segment → split 3-4s → select sequentially until VO duration
-        timeblock_clips = []
-        for i, tb in enumerate(source_tbs):
+    elif beats and not source_tbs:
+        # Beats-only mode: gunakan beat spacing untuk menentukan durasi klip,
+        # lalu potong langsung dari video sumber menggunakan src_at_ms/src_length_ms jika tersedia.
+        beat_clips_dir = segment_work_dir / "beat_clips"; beat_clips_dir.mkdir(exist_ok=True)
+        try:
+            beats_sorted = sorted(beats, key=lambda b: b.get('at_ms', 0))
+        except Exception:
+            beats_sorted = beats
+        if kwargs.get("progress_callback"):
+            try:
+                kwargs["progress_callback"](f"[BeatsOnly] {segment_label}: processing beats directly on source video (no timeblocks)")
+            except Exception:
+                pass
+        rng = random.Random()
+        acc = 0.0
+        src_total = get_duration(str(source_video_path)) or 0.0
+        # Tentukan target durasi per beat berdasarkan jarak antar beat
+        vo_duration = get_duration(vo_audio_path)
+        if not vo_duration or vo_duration <= 0:
+            return None
+        times_ms = [int(max(0, b.get('at_ms', 0))) for b in beats_sorted]
+        # Pastikan monoton naik
+        times_ms = sorted([t for t in times_ms if isinstance(t, (int, float))])
+        if not times_ms:
+            return None
+        # Tambah sentinel di akhir = durasi VO (ms)
+        times_ms.append(int(vo_duration * 1000))
+        # Jika mayoritas src_at_ms = 0 (atau tidak ada), abaikan src_at_ms dari beats dan
+        # peta posisi beat ke posisi dalam video sumber secara proporsional agar tidak mengulang dari 0s.
+        zero_src_ratio = 0.0
+        try:
+            zero_src_ratio = sum(1 for b in beats_sorted if int(b.get('src_at_ms', 0) or 0) <= 0) / float(len(beats_sorted) or 1)
+        except Exception:
+            zero_src_ratio = 1.0
+        min_dur = 0.6; max_dur = 4.0
+        for bi in range(len(times_ms) - 1):
             if stop_event.is_set(): return None
-            start_sec = _ts_to_seconds(str(tb['start']).replace(',', '.'))
-            end_sec = _ts_to_seconds(str(tb['end']).replace(',', '.'))
-            duration = max(0.01, end_sec - start_sec)
-            clip_path = segment_work_dir / f"tb_{i}.mp4"
+            start_ms = times_ms[bi]
+            next_ms = times_ms[bi + 1]
+            gap_sec = max(0.1, (next_ms - start_ms) / 1000.0)
+            target_dur = min(max_dur, max(min_dur, gap_sec))
+            b = beats_sorted[min(bi, len(beats_sorted) - 1)]
+            src_off = float(b.get('src_at_ms', 0) or 0) / 1000.0
+            src_len = float(b.get('src_length_ms', 0) or 0) / 1000.0
+            if (zero_src_ratio >= 0.6) and src_total > 0.1:
+                # Map progres beat ke posisi video sumber agar tersebar merata
+                try:
+                    prog = min(1.0, max(0.0, (float(b.get('at_ms', 0) or 0) / 1000.0) / float(vo_duration)))
+                except Exception:
+                    prog = (bi / max(1.0, float(len(beats_sorted))))
+                base_max = max(0.0, src_total - target_dur - 0.05)
+                jitter = rng.uniform(-0.25, 0.25)
+                src_off = min(base_max, max(0.0, prog * base_max + jitter))
+            # Jika tidak ada info sumber, sampling dari video sumber secara melingkar
+            if not src_len or src_len <= 0.01:
+                if src_total <= 0.1:
+                    continue
+                if src_off <= 0.0 or src_off >= src_total:
+                    src_off = rng.uniform(0.0, max(0.0, src_total - 0.5))
+                src_len = max(0.1, min(max_dur, src_total - src_off))
+            dur = min(target_dur, src_len)
+            if src_total:
+                dur = min(dur, max(0.1, src_total - src_off))
+            if dur < 0.3:
+                continue
+            out_clip = beat_clips_dir / f"beat_{bi:03d}_{len(selected):03d}.mp4"
             cmd = (
-                f"ffmpeg -ss {start_sec:.3f} -t {duration:.3f} -i \"{source_video_path}\" "
-                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{clip_path}\""
+                f"ffmpeg -ss {src_off:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
+                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
+                f"{_meta_flags()} \"{out_clip}\""
             )
             if not run_ffmpeg_command(cmd, **kwargs): return None
-            timeblock_clips.append(clip_path)
-
-        if stop_event.is_set(): return None
-        concat_list_path = segment_work_dir / "concat_list.txt"
-        with open(concat_list_path, "w", encoding="utf-8") as f:
-            for clip in timeblock_clips:
-                f.write(f"file '{_ffconcat_escape(clip)}'\n")
-
-        seg_raw_path = segment_work_dir / "seg_raw.mp4"
-        concat_command_1 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
-                            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_raw_path}\"")
-        if not run_ffmpeg_command(concat_command_1, **kwargs): return None
-
-        if stop_event.is_set(): return None
-        # Bangun kandidat klip 3-4 detik dengan durasi acak (bukan nilai tengah)
-        raw_clips_dir = segment_work_dir / "raw_clips"; raw_clips_dir.mkdir(exist_ok=True)
-        seg_raw_dur = get_duration(str(seg_raw_path)) or 0.0
-        if seg_raw_dur <= 0.1: return None
-        rng = random.Random()
-        pos = 0.0; cand_paths = []; cand_durs = []
-        while pos < seg_raw_dur - 0.05:
-            dur = rng.uniform(3.0, 4.0)
-            if pos + dur > seg_raw_dur:
-                dur = max(0.1, seg_raw_dur - pos)
-            if dur < 0.5:
-                break
-            cand = raw_clips_dir / f"cand_{len(cand_paths):03d}.mp4"
-            cut_cmd = (
-                f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{seg_raw_path}\" "
-                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                f"{_meta_flags()} \"{cand}\""
-            )
-            if not run_ffmpeg_command(cut_cmd, **kwargs): return None
-            cand_paths.append(cand); cand_durs.append(dur)
-            pos += dur
-
-        vo_duration = get_duration(vo_audio_path)
-        if not vo_duration or vo_duration <= 0: return None
-        avail = len(cand_paths)
-        avg_dur = (sum(cand_durs)/avail) if avail else 3.5
-        needed = min(avail, max(1, int(math.ceil(float(vo_duration) / max(0.1, avg_dur)))))
-        stride = (avail / float(needed)) if needed > 0 else 1.0
-        indices = sorted({min(avail-1, int(math.floor(i*stride))) for i in range(needed)})
-        # Akumulasi sampai >= VO, jika kurang tambahkan indeks berikutnya bertetangga
-        acc = 0.0
-        for idx in indices:
-            if stop_event.is_set(): return None
-            selected.append(cand_paths[idx])
-            acc += float(get_duration(str(cand_paths[idx])) or cand_durs[idx])
-            if acc >= float(vo_duration): break
-        next_idx = indices[-1] + 1 if indices else 0
-        while acc < float(vo_duration) and next_idx < avail:
-            if stop_event.is_set(): return None
-            selected.append(cand_paths[next_idx])
-            acc += float(get_duration(str(cand_paths[next_idx])) or cand_durs[next_idx])
-            next_idx += 1
-        # Trim last clip to fit VO exactly
+            selected.append(out_clip)
+            acc += float(get_duration(str(out_clip)) or dur)
+        # Jika beats total < VO, tambahkan filler langsung dari video sumber
+        if acc < float(vo_duration) and src_total > 0.1:
+            if kwargs.get("progress_callback"):
+                try:
+                    kwargs["progress_callback"](f"[BeatsOnly] Filler needed: {float(vo_duration)-acc:.2f}s; sampling extra 3-4s from source")
+                except Exception:
+                    pass
+            pos = 0.0
+            while acc < float(vo_duration):
+                if stop_event.is_set(): return None
+                dur = rng.uniform(3.0, 4.0)
+                if pos + dur > src_total:
+                    pos = 0.0  # wrap around
+                out_clip = segment_work_dir / f"filler_src_{len(selected):03d}.mp4"
+                cmd = (
+                    f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
+                    f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
+                    f"{_meta_flags()} \"{out_clip}\""
+                )
+                if not run_ffmpeg_command(cmd, **kwargs): return None
+                selected.append(out_clip)
+                acc += float(get_duration(str(out_clip)) or dur)
+                pos += dur
+        # Trim klip terakhir agar pas VO
         if selected:
             overshoot = acc - float(vo_duration)
             if overshoot > 0.05:
                 last_clip = selected[-1]
                 last_dur = get_duration(str(last_clip)) or 0.0
                 keep = max(0.1, last_dur - overshoot)
-                trimmed = raw_clips_dir / f"{last_clip.stem}_trim.mp4"
+                trimmed = segment_work_dir / f"{last_clip.stem}_trim.mp4"
                 trim_cmd = (
                     f"ffmpeg -y -i \"{last_clip}\" -t {keep:.3f} -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "
                     f"-c:a aac -b:a 128k -ar 48000 -ac 2 \"{trimmed}\""
@@ -392,18 +419,72 @@ def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, s
                     acc = acc - last_dur + (get_duration(str(trimmed)) or keep)
                     if kwargs.get("progress_callback"):
                         try:
-                            kwargs["progress_callback"](f"[Sync] Trimmed last clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
+                            kwargs["progress_callback"](f"[Sync] Trimmed last beat/filler clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
                         except Exception:
                             pass
-        if not selected: return None
-        # Log rencana seleksi
+        if not selected:
+            return None
         if kwargs.get("progress_callback"):
             try:
-                kwargs["progress_callback"](f"[ClipsPlan] available={avail}, needed~={needed}, stride={stride:.2f}, selected={len(selected)}")
-                sel_total = sum([get_duration(str(c)) or 0.0 for c in selected])
-                kwargs["progress_callback"](f"[Clips] Selected {len(selected)} clips totaling {sel_total:.2f}s to match VO {vo_duration:.2f}s")
+                kwargs["progress_callback"](f"[Clips] {segment_label}: {len(selected)} clips (beats-only) totaling {acc:.2f}s vs VO {vo_duration:.2f}s")
             except Exception:
                 pass
+    else:
+        # Fallback: timeblocks → join → segment → split 3-4s → select sequentially until VO duration
+        if not source_tbs:
+            # Tidak ada beats maupun timeblocks → abort segmen
+            if kwargs.get("progress_callback"):
+                try:
+                    kwargs["progress_callback"](f"[Fallback] {segment_label}: no beats and no source_timeblocks available; aborting segment")
+                except Exception:
+                    pass
+            return None
+        # Abaikan timeblocks; potong langsung dari video sumber sampai menutup VO
+        vo_duration = get_duration(vo_audio_path)
+        if not vo_duration or vo_duration <= 0: return None
+        src_total = get_duration(str(source_video_path)) or 0.0
+        if src_total <= 0.1: return None
+        rng = random.Random()
+        acc = 0.0
+        pos = 0.0
+        # reset selected untuk jalur ini
+        selected = []
+        while acc < float(vo_duration):
+            if stop_event.is_set(): return None
+            dur = rng.uniform(3.0, 4.0)
+            if pos + dur > src_total:
+                pos = 0.0
+                continue
+            out_clip = segment_work_dir / f"src_{len(selected):03d}.mp4"
+            cmd = (
+                f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
+                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
+                f"{_meta_flags()} \"{out_clip}\""
+            )
+            if not run_ffmpeg_command(cmd, **kwargs): return None
+            selected.append(out_clip)
+            acc += float(get_duration(str(out_clip)) or dur)
+            pos += dur
+        # Trim agar pas VO
+        overshoot = acc - float(vo_duration)
+        if selected and overshoot > 0.05:
+            last_clip = selected[-1]
+            last_dur = get_duration(str(last_clip)) or 0.0
+            keep = max(0.1, last_dur - overshoot)
+            trimmed = segment_work_dir / f"{last_clip.stem}_trim.mp4"
+            trim_cmd = (
+                f"ffmpeg -y -i \"{last_clip}\" -t {keep:.3f} -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "
+                f"-c:a aac -b:a 128k -ar 48000 -ac 2 \"{trimmed}\""
+            )
+            if run_ffmpeg_command(trim_cmd, **kwargs):
+                selected[-1] = trimmed
+                acc = acc - last_dur + (get_duration(str(trimmed)) or keep)
+                if kwargs.get("progress_callback"):
+                    try:
+                        kwargs["progress_callback"](f"[Sync] Trimmed last clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
+                    except Exception:
+                        pass
+        if not selected: return None
 
     effected_clips_dir = segment_work_dir / "effected_clips"; effected_clips_dir.mkdir(exist_ok=True)
     effect_rules = segment_data.get('edit_rules', {})

@@ -52,17 +52,13 @@ PACING & WORD BUDGET (WAJIB):
 - Jika |delta_sec| > 2% → revisi VO hingga fit=OK.
 
 RENCANA VIDEO (per segmen):
-- Gunakan `source_timeblocks` dari SRT sebagai bahan visual.
-- Total durasi hasil edit HARUS sama dengan durasi VO.
-- Pecah visual menjadi klip 3-4 detik secara BERURUTAN (bukan potongan kontinu panjang).
-- Urutan klip mengikuti urutan narasi/VO (ascending `at_ms`) dan menjaga progresi waktu sumber (gunakan `block_index` dan posisi di timeblock secara menaik) agar visual sinkron dengan VO.
+- Gunakan BEATS saja sebagai tulang visual (tanpa `source_timeblocks`).
+- Total durasi hasil edit HARUS sama dengan durasi VO segmen.
+- Durasi klip per beat mengikuti jarak antar beat (variatif 0.6–4.0 detik).
+- Urutan klip mengikuti urutan narasi/VO (ascending `at_ms`).
+- Struktur beat (JSON): { "at_ms": <pos_ms_di_timeline_segm>, "src_at_ms": <pos_ms_di_video_sumber>, "src_length_ms": <durasi_klip_ms>, "note": "opsional" }
+- Jika butuh klip lebih panjang, tambah beat berikutnya (jangan membuat satu beat > 4000 ms).
 - Efek visual akan ditambahkan otomatis saat proses editing. JANGAN keluarkan daftar efek dalam output.
-- Wajib menandai BEATS sebagai tulang visual (bone) untuk SETIAP klip 3–4 detik (tepat satu beat per klip):
-  - Struktur beat (JSON): { "at_ms": <waktu_segm_ms>, "block_index": <idx_timeblock>, "src_at_ms": <posisi_ms_dalam_timeblock>, "src_length_ms": <durasi_klip_ms>, "note": "opsional" }
-  - `src_length_ms` WAJIB berada di rentang 3000–4000 ms. Jika butuh durasi lebih panjang, pecah menjadi beberapa beat beruntun pada timeblock sama atau berikutnya — JANGAN membuat satu beat/klip kontinu > 4000 ms.
-  - `block_index` mengacu ke indeks pada array `source_timeblocks`.
-  - `at_ms` adalah posisi penempatan klip di timeline segmen (mulai 0), urut dan berkelanjutan hingga menutup durasi VO.
-  - Urutan beats wajib konsisten dan mengikuti urutan naratif timeblocks agar visual koheren.
 
 VALIDASI (WAJIB):
 - Laporkan word budget di `vo_meta`:
@@ -122,14 +118,14 @@ SKEMA JSON KELUARAN:
         "transition_duration_sec": 0.5
       },
       "beats": [
-        {"at_ms": 0, "block_index": 0, "src_at_ms": 0, "src_length_ms": 3500, "note": "opening context"}
+        {"at_ms": 0, "src_at_ms": 0, "src_length_ms": 1200, "note": "opening context"}
       ]
     }
   ]
 }
 """
 
-# Prompt sederhana untuk mode cepat (Flash)
+# Prompt sederhana untuk mode cepat (Flash) — BEATS only
 STORYBOARD_PROMPT_SIMPLE = """
 Anda adalah AI untuk membuat storyboard film recap.
 Input: subtitle SRT film berdurasi {durasi_film} menit.
@@ -137,10 +133,10 @@ Output: JSON storyboard.
 
 TUGAS UTAMA:
 1) Bagi film jadi 5 segmen: Intro, Rising, Mid-conflict, Climax, Ending
-2) Pilih timeblock penting dari SRT untuk setiap segmen (start-end + alasan singkat)
-3) Tulis VO (voice over) bahasa {lang} untuk setiap segmen sesuai durasi target
+2) Tulis VO (voice over) bahasa {lang} untuk setiap segmen sesuai durasi target
+3) Buat BEATS (tanpa timeblocks) sebagai tulang visual; setiap beat adalah 1 klip
 
-TARGET DURASI (detik): Intro={intro_sec}, Rising={rising_sec}, Mid-conflict={mid_sec}, Climax={climax_sec}, Ending={ending_sec}
+TARGET DURASI (detik): Intro={intro_vo_sec}, Rising={rising_vo_sec}, Mid-conflict={mid_vo_sec}, Climax={climax_vo_sec}, Ending={ending_vo_sec}
 
 FORMAT JSON OUTPUT:
 {{
@@ -149,12 +145,10 @@ FORMAT JSON OUTPUT:
     {{
       "label": "Intro",
       "vo_language": "{lang}",
-      "target_vo_duration_sec": {intro_sec},
+      "target_vo_duration_sec": {intro_vo_sec},
       "vo_script": "HOOK menarik di awal... (narasi ulang, ringkas, padat)",
       "vo_meta": {{"speech_rate_wpm": 160, "fit": "OK"}},
-      "source_timeblocks": [
-        {{"start": "00:01:30,000", "end": "00:03:15,000", "reason": "opening scene"}}
-      ]
+      "beats": [{{"at_ms": 0, "src_at_ms": 0, "src_length_ms": 1200, "note": "opening scene"}}]
     }}
   ]
 }}
@@ -186,7 +180,7 @@ def _ensure_storyboard_minimal_fields(sb: dict, film_duration: int, language: st
         vr.setdefault("speech_rate_wpm", 160)
         vr.setdefault("fit", "OK")
         seg["vo_meta"] = vr
-        seg.setdefault("source_timeblocks", [{"start": "00:00:00,000", "end": "00:00:10,000", "reason": "auto"}])
+        # Beats-only mode: jangan paksa field source_timeblocks
         if "target_vo_duration_sec" not in seg:
             # default ringan 180s
             seg["target_vo_duration_sec"] = 180
@@ -203,7 +197,7 @@ def _ensure_storyboard_minimal_fields(sb: dict, film_duration: int, language: st
                 "target_vo_duration_sec": du,
                 "vo_script": f"Narasi {lab}.",
                 "vo_meta": {"speech_rate_wpm": 160, "fit": "OK"},
-                "source_timeblocks": [{"start": "00:00:00,000", "end": "00:00:10,000", "reason": lab}],
+                # Beats-only mode: hilangkan contoh source_timeblocks
             })
     sb["segments"] = segs
     return sb
@@ -245,11 +239,11 @@ def get_storyboard_from_srt_fast(
         .replace("{durasi_film}", str(int(film_duration//60))) \
         .replace("{durasi_total_detik}", str(int(film_duration))) \
         .replace("{lang}", language) \
-        .replace("{intro_sec}", str(secs_map["Intro"])) \
-        .replace("{rising_sec}", str(secs_map["Rising"])) \
-        .replace("{mid_sec}", str(secs_map["Mid-conflict"])) \
-        .replace("{climax_sec}", str(secs_map["Climax"])) \
-        .replace("{ending_sec}", str(secs_map["Ending"]))
+        .replace("{intro_vo_sec}", str(secs_map["Intro"])) \
+        .replace("{rising_vo_sec}", str(secs_map["Rising"])) \
+        .replace("{mid_vo_sec}", str(secs_map["Mid-conflict"])) \
+        .replace("{climax_vo_sec}", str(secs_map["Climax"])) \
+        .replace("{ending_vo_sec}", str(secs_map["Ending"]))
 
     last_exc = None
     uploaded_per_key = {}
@@ -465,7 +459,7 @@ def get_storyboard_from_srt(
                 f"Bahasa VO: {language}\n"
                 "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
                 "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
-                "source_timeblocks, edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip 3-4 detik).\n"
+                "edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip, durasi variatif 0.6-4.0 detik).\n"
                 "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
                 "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
                 f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
@@ -486,14 +480,13 @@ def get_storyboard_from_srt(
                 "    \"delta_sec\": 0.0,\n"
                 "    \"fit\": \"OK\"\n"
                 "  },\n"
-                "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
                 "  \"edit_rules\": {\n"
                 "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
                 "    \"transition_every_sec\": 25,\n"
                 "    \"transition_type\": \"crossfade\",\n"
                 "    \"transition_duration_sec\": 0.5\n"
                 "  },\n"
-                "  \"beats\": [ {\"at_ms\": 0, \"block_index\": 0, \"src_at_ms\": 0, \"src_length_ms\": 3500, \"note\": \"...\"} ]\n"
+                "  \"beats\": [ {\"at_ms\": 0, \"src_at_ms\": 0, \"src_length_ms\": 1200, \"note\": \"...\"} ]\n"
                 "}\n"
             )
 
@@ -559,11 +552,11 @@ def get_storyboard_from_srt(
         # Selalu gunakan file upload untuk planner utama (tetap fallback ke excerpt jika gagal)
         use_upload = True
 
-        # Planner untuk timeblocks minimal
+        # Planner nonaktif untuk timeblocks; fokus pada BEATS
         plan_prompt = (
             system_prompt + "\n\n# Planner Timeblocks (JSON saja)\n"
             "Instruksi: Keluarkan JSON dengan array 'segments' berisi 5 item (Intro, Rising, Mid-conflict, Climax, Ending).\n"
-            "Setiap item wajib berisi: label, source_timeblocks (daftar objek {start,end,reason}).\n"
+            "Setiap item wajib berisi: label saja. (Beats akan dihasilkan di tahap berikutnya).\n"
             "Jangan keluarkan VO, beats, atau bidang lain. JSON minimal saja.\n"
         )
         # Planner dengan retry + fallback excerpt jika timeout
@@ -583,7 +576,7 @@ def get_storyboard_from_srt(
         tries_plan = 0; plan_resp = None
         while tries_plan < 3:
             tries_plan += 1
-            log(f"Meminta planner timeblocks minimal... (try {tries_plan}/3)")
+            log(f"Meminta planner (beats-only) ... (try {tries_plan}/3)")
             plan_resp = None
             # Coba dengan upload file per-key agar tidak ada 403 (permission)
             for ki, k in enumerate(available_keys, 1):
@@ -668,11 +661,11 @@ def get_storyboard_from_srt(
                 f"Bahasa VO: {language}\n"
                 "Instruksi: Hanya keluarkan JSON untuk SATU segmen di bawah ini, tanpa catatan tambahan.\n"
                 "Wajib isi: label, vo_language, target_vo_duration_sec, vo_script, vo_meta (speech_rate_wpm, fill_ratio=0.90, words_target, words_actual, sentences, commas, predicted_duration_sec, delta_sec, fit),\n"
-                "source_timeblocks, edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip 3-4 detik).\n"
+                "edit_rules (cut_length_sec 3-4, tanpa daftar efek), dan beats (satu beat per klip, durasi variatif 0.6-4.0 detik).\n"
                 "Kepatuhan durasi & kata WAJIB: gunakan angka eksplisit di bawah ini.\n\n"
                 "PARAMETER SEGMENT (WAJIB DIGUNAKAN):\n"
                 f"- target_vo_duration_sec={vo_sec}, speech_rate_wpm={wpm}, words_target={words}\n\n"
-                "SRT RINGKAS (relevan untuk segmen ini):\n" + ranges_sample + "\n\n"
+                "SRT RINGKAS (opsional untuk konteks):\n" + ranges_sample + "\n\n"
                 "Format JSON yang diminta:\n"
                 "{\n"
                 f"  \"label\": \"{label}\",\n"
@@ -690,14 +683,13 @@ def get_storyboard_from_srt(
                 "    \"delta_sec\": 0.0,\n"
                 "    \"fit\": \"OK\"\n"
                 "  },\n"
-                "  \"source_timeblocks\": [ {\"start\": \"HH:MM:SS.mmm\", \"end\": \"HH:MM:SS.mmm\", \"reason\": \"...\"} ],\n"
                 "  \"edit_rules\": {\n"
                 "    \"cut_length_sec\": {\"min\": 3.0, \"max\": 4.0},\n"
                 "    \"transition_every_sec\": 25,\n"
                 "    \"transition_type\": \"crossfade\",\n"
                 "    \"transition_duration_sec\": 0.5\n"
                 "  },\n"
-                "  \"beats\": [ {\"at_ms\": 0, \"block_index\": 0, \"src_at_ms\": 0, \"src_length_ms\": 3500, \"note\": \"...\"} ]\n"
+                "  \"beats\": [ {\"at_ms\": 0, \"src_at_ms\": 0, \"src_length_ms\": 1200, \"note\": \"...\"} ]\n"
                 "}\n"
             )
 
