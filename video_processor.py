@@ -10,49 +10,6 @@ import threading
 from ffmpeg_utils import run_ffmpeg_command, get_duration
 import math
 
-def _meta_flags() -> str:
-    # Safe container flags to improve playback/concat behavior
-    return "-movflags +faststart"
-
-def _pad_video_with_still(input_path: pathlib.Path, vid_len: float, target_len: float, work_dir: pathlib.Path, **kwargs):
-    """Pad video by freezing the last frame and concatenating a still clip.
-    Returns pathlib.Path to padded video or None on failure.
-    """
-    progress = kwargs.get("progress_callback") or (lambda *_: None)
-    pad_sec = max(0.0, float(target_len) - float(vid_len) + 0.02)
-    if pad_sec <= 0.0:
-        return input_path
-    try:
-        last_img = work_dir / "last_frame.jpg"
-        still_path = work_dir / "seg_pad_still.mp4"
-        orig_wo_path = work_dir / "seg_joined_wo.mp4"
-        padded_path = work_dir / "seg_joined_padded.mp4"
-        # 1) Extract last frame
-        start = max(0.0, float(vid_len) - 0.04)
-        cmd1 = (f"ffmpeg -y -ss {start:.3f} -i \"{input_path}\" -frames:v 1 \"{last_img}\"")
-        if not run_ffmpeg_command(cmd1, **kwargs):
-            return None
-        # 2) Build still video for pad duration (video only)
-        cmd2 = (f"ffmpeg -y -loop 1 -t {pad_sec:.3f} -i \"{last_img}\" -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{still_path}\"")
-        if not run_ffmpeg_command(cmd2, **kwargs):
-            return None
-        # 3) Make original segment video-only to match streams for concat
-        cmd3 = (f"ffmpeg -y -i \"{input_path}\" -an -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \"{orig_wo_path}\"")
-        if not run_ffmpeg_command(cmd3, **kwargs):
-            return None
-        # 4) Concat
-        concat_list = work_dir / "concat_pad_list.txt"
-        with open(concat_list, "w", encoding="utf-8") as f:
-            f.write(f"file '{_ffconcat_escape(orig_wo_path)}'\n")
-            f.write(f"file '{_ffconcat_escape(still_path)}'\n")
-        cmd4 = (f"ffmpeg -y -f concat -safe 0 -i \"{concat_list}\" -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{padded_path}\"")
-        if not run_ffmpeg_command(cmd4, **kwargs):
-            return None
-        progress(f"[Sync] Fallback padded by {pad_sec:.2f}s using last-frame freeze")
-        return padded_path
-    except Exception:
-        return None
-
 def _ts_to_seconds(ts: str) -> float:
     try:
         ts = (ts or "").strip().replace(',', '.')
@@ -61,36 +18,17 @@ def _ts_to_seconds(ts: str) -> float:
     except Exception:
         return 0.0
 
-def _ffconcat_escape(path_obj: pathlib.Path) -> str:
-    """Escape path for ffmpeg concat demuxer (single quotes)."""
-    s = path_obj.resolve().as_posix()
-    return s.replace("'", "'\\''")
-
 def _apply_effects(clip_path, effects, output_path, **kwargs):
     """Applies a list of effects to a single clip using FFmpeg's filter_complex."""
     if not effects:
         shutil.copy(clip_path, output_path)
         return True
-    # Build visual filters based on effect names
-    filter_map = {
-        "hflip": "hflip",
-        # Slight color boost
-        "contrast_plus": "eq=contrast=1.08:saturation=1.15",
-        "sat_plus": "eq=saturation=1.15",
-        # Slight static zoom-in (no speed change)
-        "zoom_light": "scale=iw*1.06:ih*1.06,crop=iw:ih",
-        # Gentle horizontal pan with small zoom to avoid black borders (uses time t)
-        "crop_pan_light": "scale=iw*1.06:ih*1.06,crop=iw:ih:x='(in_w-iw)/2 - 20*t':y='(in_h-ih)/2'",
-    }
+    filter_map = {"hflip": "hflip", "contrast_plus": "eq=contrast=1.1:saturation=1.2"}
     vf_filters = [filter_map[effect] for effect in effects if effect in filter_map]
     if not vf_filters:
         shutil.copy(clip_path, output_path)
         return True
-    # Re-encode audio to ensure concat compatibility
-    command = (
-        f'ffmpeg -i "{clip_path}" -vf "{",".join(vf_filters)}" '
-        f'-c:a aac -b:a 128k -ar 48000 -ac 2 "{output_path}"'
-    )
+    command = f'ffmpeg -i "{clip_path}" -vf "{",".join(vf_filters)}" -c:a copy "{output_path}"'
     return run_ffmpeg_command(command, **kwargs)
 
 def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
@@ -101,8 +39,7 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
 
     main_vol = user_settings.get("main_vo_volume", 1.0)
     if main_vol != 1.0:
-        # audio_stream already includes brackets, e.g., "[0:a]"
-        audio_filters.append(f"{audio_stream}volume={main_vol}[a_main_vol]")
+        audio_filters.append(f"[{audio_stream}]volume={main_vol}[a_main_vol]")
         audio_stream = "[a_main_vol]"
 
     if user_settings.get("bgm_path"):
@@ -140,438 +77,367 @@ def _apply_final_effects(input_path, output_path, user_settings, **kwargs):
         return True
 
     filter_complex = ";".join(video_filters + audio_filters)
-    # Tentukan pemetaan audio: jika tidak ada audio filter, map langsung 0:a (bukan label filter)
-    used_audio_filters = len(audio_filters) > 0
-    video_map = f'"{video_stream}"'  # video_stream adalah label filter seperti [v_out]
-    audio_map = f'"{audio_stream}"' if used_audio_filters else '0:a'
     # OPTIMASI KECEPATAN
     command = (f'ffmpeg {inputs} -filter_complex "{filter_complex}" '
-               f'-map {video_map} -map {audio_map} -r 25 -c:v libx264 -preset veryfast '
-               f'-c:a aac -b:a 128k -ar 48000 -ac 2 "{output_path}"')
+               f'-map "{video_stream}" -map "{audio_stream}" -c:v libx264 -preset veryfast {output_path}')
     return run_ffmpeg_command(command, **kwargs)
 
-def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, stop_event, **kwargs):
-    """Processes a single video segment from cutting to VO syncing."""
+def auto_extend_beats_with_gaps(segment, film_duration_sec):
+    """Auto-extend beats dengan gap pattern ketika beats habis"""
+    beats = segment.get("beats", [])
+    target_duration_sec = segment.get("target_vo_duration_sec", 0)
+
+    if not beats:
+        return segment
+
+    # Hitung durasi beats existing
+    current_duration = sum(beat.get("src_length_ms", 0) for beat in beats) / 1000.0
+
+    if current_duration >= target_duration_sec:
+        return segment
+
+    # Kumpulkan posisi yang sudah digunakan untuk wrap-around
+    used_positions = [beat.get("src_at_ms", 0) for beat in beats]
+
+    # Cari posisi terakhir di video sumber
+    last_beat = beats[-1]
+    last_src_end_ms = last_beat.get("src_at_ms", 0) + last_beat.get("src_length_ms", 0)
+
+    # Timeline position untuk beat baru
+    current_timeline_ms = int(current_duration * 1000)
+    current_src_ms = last_src_end_ms
+
+    # Generate beats sampai durasi tercukupi
+    import random
+    while current_duration < target_duration_sec:
+        # Gunakan `calculate_dynamic_gap`
+        gap_sec = calculate_dynamic_gap(current_src_ms / 1000.0, film_duration_sec)
+        gap_duration_ms = int(gap_sec * 1000)
+        current_src_ms += gap_duration_ms
+
+        # Gunakan `handle_film_end_wraparound`
+        current_src_ms = handle_film_end_wraparound(current_src_ms, film_duration_sec, used_positions)
+
+        # Duration klip berikutnya
+        remaining_sec = target_duration_sec - current_duration
+        clip_duration_ms = min(random.randint(3000, 4000), int(remaining_sec * 1000))
+
+        if clip_duration_ms < 1000:
+            break
+
+        # Tambah beat baru
+        new_beat = {
+            "at_ms": current_timeline_ms,
+            "src_at_ms": current_src_ms,
+            "src_length_ms": clip_duration_ms,
+            "note": f"Auto-extended with gap from {current_src_ms/1000:.1f}s"
+        }
+
+        beats.append(new_beat)
+
+        # Tambahkan posisi baru ke used_positions
+        used_positions.append(current_src_ms)
+
+        # Update tracking
+        current_timeline_ms += clip_duration_ms
+        current_src_ms += clip_duration_ms
+        current_duration += clip_duration_ms / 1000.0
+
+    segment["beats"] = beats
+    return segment
+
+def calculate_dynamic_gap(current_position_sec, film_duration_sec):
+    """Hitung gap yang dinamis berdasarkan posisi"""
+    import random
+
+    # Base gap 5-15 detik
+    base_gap = random.randint(5, 15)
+
+    # Adjust berdasarkan posisi di film
+    if current_position_sec < film_duration_sec * 0.3:  # Awal film
+        return random.randint(8, 20)  # Gap lebih besar
+    elif current_position_sec > film_duration_sec * 0.7:  # Akhir film
+        return random.randint(5, 12)  # Gap lebih kecil
+    else:  # Middle
+        return random.randint(6, 18)  # Gap medium
+
+def handle_film_end_wraparound(current_src_ms, film_duration_sec, used_positions):
+    """Handle ketika mendekati akhir film"""
+    film_duration_ms = film_duration_sec * 1000
+
+    if current_src_ms >= film_duration_ms - 30000:  # 30 detik dari akhir
+        # Cari posisi yang belum terpakai di awal/tengah film
+        import random
+
+        # Buat list kandidat posisi (dalam chunk 30 detik)
+        candidates = []
+        for i in range(0, int(film_duration_ms), 30000):  # Setiap 30 detik
+            chunk_start = i
+            chunk_end = min(i + 30000, film_duration_ms)
+
+            # Cek apakah chunk ini sudah banyak terpakai
+            usage_count = sum(1 for pos in used_positions
+                            if chunk_start <= pos <= chunk_end)
+
+            if usage_count < 3:  # Max 3 klip per chunk 30 detik
+                candidates.append(chunk_start)
+
+        if candidates:
+            return random.choice(candidates) + random.randint(0, 25000)
+
+    return current_src_ms
+
+def validate_gap_pattern(beats):
+    """Validasi pattern gap untuk copyright safety"""
+    violations = []
+
+    for i in range(len(beats) - 1):
+        current_end = beats[i]['src_at_ms'] + beats[i]['src_length_ms']
+        next_start = beats[i+1]['src_at_ms']
+
+        gap_sec = (next_start - current_end) / 1000.0
+
+        if gap_sec < 4:  # Gap terlalu kecil
+            violations.append({
+                'beat_index': i,
+                'gap_duration': gap_sec,
+                'issue': 'Gap too small for copyright safety'
+            })
+        elif gap_sec > 60:  # Gap terlalu besar
+            violations.append({
+                'beat_index': i,
+                'gap_duration': gap_sec,
+                'issue': 'Gap too large, may break narrative flow'
+            })
+
+    return violations
+
+def finalize_storyboard_with_auto_extension(storyboard, film_duration_sec):
+    """Finalisasi storyboard dengan auto-extension"""
+
+    for segment in storyboard.get("segments", []):
+        # Auto-extend beats jika kurang
+        segment = auto_extend_beats_with_gaps(segment, film_duration_sec)
+
+        # Validate pattern
+        violations = validate_gap_pattern(segment.get("beats", []))
+
+        if violations:
+            print(f"Segment {segment['label']}: {len(violations)} gap violations")
+            # Log violations tapi lanjut (gap violations tidak fatal)
+
+        # Final validation durasi
+        total_beats_duration = sum(
+            beat.get("src_length_ms", 0) for beat in segment.get("beats", [])
+        ) / 1000.0
+
+        target = segment.get("target_vo_duration_sec", 0)
+        if abs(total_beats_duration - target) > 5:  # Tolerance 5 detik
+            print(f"WARNING: {segment['label']} beats duration {total_beats_duration:.1f}s != target {target}s")
+
+    return storyboard
+
+
+def _process_segment_from_beats(segment_data, vo_audio_path, source_video_path, work_dir, film_duration_sec, stop_event, **kwargs):
+    """
+    Processes a single video segment based on a list of 'beats'.
+    This method supports auto-extending beats to match VO duration.
+    """
     segment_label = segment_data['label']
-    kwargs['progress_callback'](f"--- Memulai proses untuk segmen: {segment_label} ---")
+    progress_callback = kwargs.get('progress_callback', lambda msg: print(msg))
+    progress_callback(f"--- Memulai proses segmen (mode Beats): {segment_label} ---")
+
     segment_work_dir = work_dir / segment_label
     segment_work_dir.mkdir(exist_ok=True)
 
-    # Build selected clips either from beats (preferred) or fallback 3-4s sequence
-    selected = []
-    beats = segment_data.get('beats', []) or []
-    source_tbs = segment_data.get('source_timeblocks', []) or []
-    # Build readable names for timeblocks to improve logs
-    tb_names = []
-    for i, tb in enumerate(source_tbs):
-        try:
-            s = str(tb.get('start', '00:00:00,000')).replace('.', ',')
-            e = str(tb.get('end', '00:00:00,000')).replace('.', ',')
-            rs = (tb.get('reason') or '').strip().replace('\n', ' ')
-            if len(rs) > 48: rs = rs[:45] + '...'
-            tb_names.append(f"TB{i:02d} {s}-{e} | {rs}")
-        except Exception:
-            tb_names.append(f"TB{i:02d}")
-    if kwargs.get("progress_callback") and tb_names:
-        try:
-            kwargs["progress_callback"](f"[Timeblocks] {segment_label}: {len(tb_names)} items")
-            for name in tb_names[:12]:
-                kwargs["progress_callback"](f"  - {name}")
-            if len(tb_names) > 12:
-                kwargs["progress_callback"](f"  ... ({len(tb_names)-12} more)")
-        except Exception:
-            pass
-    if beats and source_tbs:
-        beat_clips_dir = segment_work_dir / "beat_clips"; beat_clips_dir.mkdir(exist_ok=True)
-        try:
-            beats_sorted = sorted(beats, key=lambda b: b.get('at_ms', 0))
-        except Exception:
-            beats_sorted = beats
-        if kwargs.get("progress_callback"):
-            try:
-                kwargs["progress_callback"](f"[Beats] {segment_label}: beats present — using beats as primary anchors")
-            except Exception:
-                pass
-        rng = random.Random()
-        acc = 0.0
-        for bi, b in enumerate(beats_sorted):
-            if stop_event.is_set(): return None
-            try:
-                block_index = int(b.get('block_index', 0))
-                src_off = max(0.0, float(b.get('src_at_ms', 0)) / 1000.0)
-                src_len = max(0.01, float(b.get('src_length_ms', 0)) / 1000.0)
-            except Exception:
-                continue
-            if block_index < 0 or block_index >= len(source_tbs):
-                continue
-            tb = source_tbs[block_index]
-            tb_start = _ts_to_seconds(str(tb['start']).replace(',', '.'))
-            tb_end = _ts_to_seconds(str(tb['end']).replace(',', '.'))
-            cur = tb_start + src_off
-            remaining = min(src_len, max(0.01, tb_end - cur))
-            # Log beat mapping
-            if kwargs.get("progress_callback"):
-                try:
-                    tb_name = tb_names[block_index] if block_index < len(tb_names) else f"TB{block_index:02d}"
-                    kwargs["progress_callback"](f"[Beats] {segment_label} beat {bi:03d} → {tb_name} @{src_off:.2f}s len={src_len:.2f}s")
-                except Exception:
-                    pass
-            # Satu potongan saja per beat: durasi acak 3–4s (atau sisa di timeblock/beat)
-            if remaining > 0.1:
-                desired = rng.uniform(3.0, 4.0)
-                dur = min(remaining, desired)
-                if dur >= 0.5:
-                    out_clip = beat_clips_dir / f"beat_{bi:03d}_{len(selected):03d}.mp4"
-                    cmd = (
-                        f"ffmpeg -ss {cur:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
-                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                        f"{_meta_flags()} \"{out_clip}\""
-                    )
-                    if not run_ffmpeg_command(cmd, **kwargs): return None
-                    selected.append(out_clip)
-                    if kwargs.get("progress_callback"):
-                        try:
-                            kwargs["progress_callback"](f"  · clip @{cur-tb_start:.2f}s dur={dur:.2f}s from {tb_name}")
-                        except Exception:
-                            pass
-                    acc += float(get_duration(str(out_clip)) or dur)
-                if remaining < 0.5:
-                    break
-        # Jika total dari beats masih kurang dari VO, tambahkan filler dari timeblocks lain
-        vo_duration = get_duration(vo_audio_path)
-        if not vo_duration or vo_duration <= 0:
-            return None
-        if acc < float(vo_duration):
-            if kwargs.get("progress_callback"):
-                try:
-                    kwargs["progress_callback"](f"[Beats] Filler needed: {float(vo_duration)-acc:.2f}s; adding extra 3-4s cuts from timeblocks")
-                except Exception:
-                    pass
-            # iterate all TBs to create additional random cuts until VO covered
-            for i, tb in enumerate(source_tbs):
-                if stop_event.is_set(): return None
-                start_sec = _ts_to_seconds(str(tb['start']).replace(',', '.'))
-                end_sec = _ts_to_seconds(str(tb['end']).replace(',', '.'))
-                pos = start_sec
-                while pos < end_sec - 0.05 and acc < float(vo_duration):
-                    dur = rng.uniform(3.0, 4.0)
-                    if pos + dur > end_sec:
-                        dur = max(0.1, end_sec - pos)
-                    if dur < 0.5:
-                        break
-                    out_clip = segment_work_dir / f"filler_tb{i:02d}_{len(selected):03d}.mp4"
-                    cmd = (
-                        f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
-                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                        f"{_meta_flags()} \"{out_clip}\""
-                    )
-                    if not run_ffmpeg_command(cmd, **kwargs): return None
-                    selected.append(out_clip)
-                    acc += float(get_duration(str(out_clip)) or dur)
-                    pos += dur
-                    if kwargs.get("progress_callback"):
-                        try:
-                            tb_name = tb_names[i] if i < len(tb_names) else f"TB{i:02d}"
-                            kwargs["progress_callback"](f"  · filler from {tb_name} @{pos-start_sec:.2f}s dur={dur:.2f}s")
-                        except Exception:
-                            pass
-        # Trim klip terakhir agar pas VO
-        if selected:
-            overshoot = acc - float(vo_duration)
-            if overshoot > 0.05:
-                last_clip = selected[-1]
-                last_dur = get_duration(str(last_clip)) or 0.0
-                keep = max(0.1, last_dur - overshoot)
-                trimmed = segment_work_dir / f"{last_clip.stem}_trim.mp4"
-                trim_cmd = (
-                    f"ffmpeg -y -i \"{last_clip}\" -t {keep:.3f} -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "
-                    f"-c:a aac -b:a 128k -ar 48000 -ac 2 \"{trimmed}\""
-                )
-                if run_ffmpeg_command(trim_cmd, **kwargs):
-                    selected[-1] = trimmed
-                    acc = acc - last_dur + (get_duration(str(trimmed)) or keep)
-                    if kwargs.get("progress_callback"):
-                        try:
-                            kwargs["progress_callback"](f"[Sync] Trimmed last beat/filler clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
-                        except Exception:
-                            pass
-        if not selected:
-            return None
-        # Log ringkas
-        if kwargs.get("progress_callback"):
-            try:
-                kwargs["progress_callback"](f"[Clips] {segment_label}: {len(selected)} clips (beats-first) totaling {acc:.2f}s vs VO {vo_duration:.2f}s")
-            except Exception:
-                pass
-        if not selected:
-            return None
-    elif beats and not source_tbs:
-        # Beats-only mode: gunakan beat spacing untuk menentukan durasi klip,
-        # lalu potong langsung dari video sumber menggunakan src_at_ms/src_length_ms jika tersedia.
-        beat_clips_dir = segment_work_dir / "beat_clips"; beat_clips_dir.mkdir(exist_ok=True)
-        try:
-            beats_sorted = sorted(beats, key=lambda b: b.get('at_ms', 0))
-        except Exception:
-            beats_sorted = beats
-        if kwargs.get("progress_callback"):
-            try:
-                kwargs["progress_callback"](f"[BeatsOnly] {segment_label}: processing beats directly on source video (no timeblocks)")
-            except Exception:
-                pass
-        rng = random.Random()
-        acc = 0.0
-        src_total = get_duration(str(source_video_path)) or 0.0
-        # Tentukan target durasi per beat berdasarkan jarak antar beat
-        vo_duration = get_duration(vo_audio_path)
-        if not vo_duration or vo_duration <= 0:
-            return None
-        times_ms = [int(max(0, b.get('at_ms', 0))) for b in beats_sorted]
-        # Pastikan monoton naik
-        times_ms = sorted([t for t in times_ms if isinstance(t, (int, float))])
-        if not times_ms:
-            return None
-        # Tambah sentinel di akhir = durasi VO (ms)
-        times_ms.append(int(vo_duration * 1000))
-        # Jika mayoritas src_at_ms = 0 (atau tidak ada), abaikan src_at_ms dari beats dan
-        # peta posisi beat ke posisi dalam video sumber secara proporsional agar tidak mengulang dari 0s.
-        zero_src_ratio = 0.0
-        try:
-            zero_src_ratio = sum(1 for b in beats_sorted if int(b.get('src_at_ms', 0) or 0) <= 0) / float(len(beats_sorted) or 1)
-        except Exception:
-            zero_src_ratio = 1.0
-        min_dur = 0.6; max_dur = 4.0
-        for bi in range(len(times_ms) - 1):
-            if stop_event.is_set(): return None
-            start_ms = times_ms[bi]
-            next_ms = times_ms[bi + 1]
-            gap_sec = max(0.1, (next_ms - start_ms) / 1000.0)
-            target_dur = min(max_dur, max(min_dur, gap_sec))
-            b = beats_sorted[min(bi, len(beats_sorted) - 1)]
-            src_off = float(b.get('src_at_ms', 0) or 0) / 1000.0
-            src_len = float(b.get('src_length_ms', 0) or 0) / 1000.0
-            if (zero_src_ratio >= 0.6) and src_total > 0.1:
-                # Map progres beat ke posisi video sumber agar tersebar merata
-                try:
-                    prog = min(1.0, max(0.0, (float(b.get('at_ms', 0) or 0) / 1000.0) / float(vo_duration)))
-                except Exception:
-                    prog = (bi / max(1.0, float(len(beats_sorted))))
-                base_max = max(0.0, src_total - target_dur - 0.05)
-                jitter = rng.uniform(-0.25, 0.25)
-                src_off = min(base_max, max(0.0, prog * base_max + jitter))
-            # Jika tidak ada info sumber, sampling dari video sumber secara melingkar
-            if not src_len or src_len <= 0.01:
-                if src_total <= 0.1:
-                    continue
-                if src_off <= 0.0 or src_off >= src_total:
-                    src_off = rng.uniform(0.0, max(0.0, src_total - 0.5))
-                src_len = max(0.1, min(max_dur, src_total - src_off))
-            dur = min(target_dur, src_len)
-            if src_total:
-                dur = min(dur, max(0.1, src_total - src_off))
-            if dur < 0.3:
-                continue
-            out_clip = beat_clips_dir / f"beat_{bi:03d}_{len(selected):03d}.mp4"
-            cmd = (
-                f"ffmpeg -ss {src_off:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
-                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                f"{_meta_flags()} \"{out_clip}\""
-            )
-            if not run_ffmpeg_command(cmd, **kwargs): return None
-            selected.append(out_clip)
-            acc += float(get_duration(str(out_clip)) or dur)
-        # Jika beats total < VO, tambahkan filler langsung dari video sumber
-        if acc < float(vo_duration) and src_total > 0.1:
-            if kwargs.get("progress_callback"):
-                try:
-                    kwargs["progress_callback"](f"[BeatsOnly] Filler needed: {float(vo_duration)-acc:.2f}s; sampling extra 3-4s from source")
-                except Exception:
-                    pass
-            pos = 0.0
-            while acc < float(vo_duration):
-                if stop_event.is_set(): return None
-                dur = rng.uniform(3.0, 4.0)
-                if pos + dur > src_total:
-                    pos = 0.0  # wrap around
-                out_clip = segment_work_dir / f"filler_src_{len(selected):03d}.mp4"
-                cmd = (
-                    f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
-                    f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                    f"{_meta_flags()} \"{out_clip}\""
-                )
-                if not run_ffmpeg_command(cmd, **kwargs): return None
-                selected.append(out_clip)
-                acc += float(get_duration(str(out_clip)) or dur)
-                pos += dur
-        # Trim klip terakhir agar pas VO
-        if selected:
-            overshoot = acc - float(vo_duration)
-            if overshoot > 0.05:
-                last_clip = selected[-1]
-                last_dur = get_duration(str(last_clip)) or 0.0
-                keep = max(0.1, last_dur - overshoot)
-                trimmed = segment_work_dir / f"{last_clip.stem}_trim.mp4"
-                trim_cmd = (
-                    f"ffmpeg -y -i \"{last_clip}\" -t {keep:.3f} -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "
-                    f"-c:a aac -b:a 128k -ar 48000 -ac 2 \"{trimmed}\""
-                )
-                if run_ffmpeg_command(trim_cmd, **kwargs):
-                    selected[-1] = trimmed
-                    acc = acc - last_dur + (get_duration(str(trimmed)) or keep)
-                    if kwargs.get("progress_callback"):
-                        try:
-                            kwargs["progress_callback"](f"[Sync] Trimmed last beat/filler clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
-                        except Exception:
-                            pass
-        if not selected:
-            return None
-        if kwargs.get("progress_callback"):
-            try:
-                kwargs["progress_callback"](f"[Clips] {segment_label}: {len(selected)} clips (beats-only) totaling {acc:.2f}s vs VO {vo_duration:.2f}s")
-            except Exception:
-                pass
-    else:
-        # Fallback: timeblocks → join → segment → split 3-4s → select sequentially until VO duration
-        if not source_tbs:
-            # Tidak ada beats maupun timeblocks → abort segmen
-            if kwargs.get("progress_callback"):
-                try:
-                    kwargs["progress_callback"](f"[Fallback] {segment_label}: no beats and no source_timeblocks available; aborting segment")
-                except Exception:
-                    pass
-            return None
-        # Abaikan timeblocks; potong langsung dari video sumber sampai menutup VO
-        vo_duration = get_duration(vo_audio_path)
-        if not vo_duration or vo_duration <= 0: return None
-        src_total = get_duration(str(source_video_path)) or 0.0
-        if src_total <= 0.1: return None
-        rng = random.Random()
-        acc = 0.0
-        pos = 0.0
-        # reset selected untuk jalur ini
-        selected = []
-        while acc < float(vo_duration):
-            if stop_event.is_set(): return None
-            dur = rng.uniform(3.0, 4.0)
-            if pos + dur > src_total:
-                pos = 0.0
-                continue
-            out_clip = segment_work_dir / f"src_{len(selected):03d}.mp4"
-            cmd = (
-                f"ffmpeg -ss {pos:.3f} -t {dur:.3f} -i \"{source_video_path}\" "
-                f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 "
-                f"{_meta_flags()} \"{out_clip}\""
-            )
-            if not run_ffmpeg_command(cmd, **kwargs): return None
-            selected.append(out_clip)
-            acc += float(get_duration(str(out_clip)) or dur)
-            pos += dur
-        # Trim agar pas VO
-        overshoot = acc - float(vo_duration)
-        if selected and overshoot > 0.05:
-            last_clip = selected[-1]
-            last_dur = get_duration(str(last_clip)) or 0.0
-            keep = max(0.1, last_dur - overshoot)
-            trimmed = segment_work_dir / f"{last_clip.stem}_trim.mp4"
-            trim_cmd = (
-                f"ffmpeg -y -i \"{last_clip}\" -t {keep:.3f} -r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p "
-                f"-c:a aac -b:a 128k -ar 48000 -ac 2 \"{trimmed}\""
-            )
-            if run_ffmpeg_command(trim_cmd, **kwargs):
-                selected[-1] = trimmed
-                acc = acc - last_dur + (get_duration(str(trimmed)) or keep)
-                if kwargs.get("progress_callback"):
-                    try:
-                        kwargs["progress_callback"](f"[Sync] Trimmed last clip by {overshoot:.2f}s to fit VO ({vo_duration:.2f}s total)")
-                    except Exception:
-                        pass
-        if not selected: return None
+    # 1. Dapatkan durasi VO untuk target perpanjangan
+    vo_duration = get_duration(vo_audio_path)
+    if not vo_duration:
+        progress_callback(f"ERROR: Tidak dapat membaca durasi dari VO: {vo_audio_path}")
+        return None
+    segment_data['target_vo_duration_sec'] = vo_duration
 
-    effected_clips_dir = segment_work_dir / "effected_clips"; effected_clips_dir.mkdir(exist_ok=True)
-    effect_rules = segment_data.get('edit_rules', {})
-    effected_clips = []
-    for i, clip_path in enumerate(selected):
+    # 2. Auto-extend beats jika perlu
+    segment_data = auto_extend_beats_with_gaps(segment_data, film_duration_sec)
+
+    # 3. Validasi pola gap
+    violations = validate_gap_pattern(segment_data.get("beats", []))
+    if violations:
+        progress_callback(f"WARNING: Segment {segment_label} memiliki {len(violations)} pelanggaran pola gap.")
+        for v in violations:
+            progress_callback(f"  - Beat {v['beat_index']}: {v['issue']} (durasi: {v['gap_duration']:.2f}s)")
+
+    beats = segment_data.get("beats", [])
+    if not beats:
+        progress_callback(f"ERROR: Tidak ada beats untuk diproses di segmen {segment_label}.")
+        return None
+
+    # 4. Potong, proses efek, dan kumpulkan klip dari setiap beat
+    processed_clips = []
+    clips_dir = segment_work_dir / "beat_clips"
+    clips_dir.mkdir(exist_ok=True)
+    effected_clips_dir = segment_work_dir / "effected_beat_clips"
+    effected_clips_dir.mkdir(exist_ok=True)
+
+    edit_rules = segment_data.get('edit_rules', {})
+    effects_pool = edit_rules.get('effects_pool', [])
+    max_effects = edit_rules.get('max_effects_per_clip', 0)
+
+    for i, beat in enumerate(beats):
         if stop_event.is_set(): return None
-        # Mandatory effects: color boost + random zoom OR pan (as requested)
-        selected_effects = ["contrast_plus", random.choice(["zoom_light", "crop_pan_light"]) ]
+
+        start_sec = beat['src_at_ms'] / 1000.0
+        duration_sec = beat['src_length_ms'] / 1000.0
+
+        clip_path = clips_dir / f"beat_{i:03d}.mp4"
+
+        # Potong klip dari sumber
+        command = (
+            f"ffmpeg -ss {start_sec:.3f} -t {duration_sec:.3f} -i \"{source_video_path}\" "
+            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{clip_path}\""
+        )
+        if not run_ffmpeg_command(command, **kwargs):
+            progress_callback(f"ERROR: Gagal memotong beat {i} untuk {segment_label}")
+            continue
+
+        # Terapkan efek
+        num_effects = random.randint(0, max_effects)
+        selected_effects = random.sample(effects_pool, num_effects) if num_effects > 0 and effects_pool else []
+        effected_path = effected_clips_dir / f"effected_beat_{i:03d}.mp4"
+        if _apply_effects(clip_path, selected_effects, effected_path, **kwargs):
+            processed_clips.append(effected_path)
+
+    if stop_event.is_set() or not processed_clips: return None
+
+    # 5. Gabungkan semua klip yang telah diproses
+    concat_list_path = segment_work_dir / "beats_concat_list.txt"
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for clip in processed_clips:
+            f.write(f"file '{clip.resolve().as_posix()}'\n")
+
+    seg_beats_joined_path = segment_work_dir / "seg_beats_joined.mp4"
+    concat_command = (
+        f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
+        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_beats_joined_path}\""
+    )
+    if not run_ffmpeg_command(concat_command, **kwargs):
+        progress_callback(f"ERROR: Gagal menggabungkan klip dari beats untuk {segment_label}")
+        return None
+
+    # 6. Gabungkan video hasil gabungan dengan audio VO (tanpa peregangan waktu)
+    final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp4"
+    command = (
+        f'ffmpeg -i "{seg_beats_joined_path}" -i "{vo_audio_path}" '
+        f'-c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -shortest "{final_segment_path}"'
+    )
+    if not run_ffmpeg_command(command, **kwargs):
+        progress_callback(f"ERROR: Gagal menggabungkan video beats dengan audio VO untuk {segment_label}")
+        return None
+
+    return final_segment_path
+
+
+def _process_segment(segment_data, vo_audio_path, source_video_path, work_dir, stop_event, **kwargs):
+    """
+    Processes a single video segment by dispatching to the appropriate
+    method based on the segment_data structure.
+    """
+    # Check if this segment should be processed using the new "beats" logic
+    if segment_data.get("beats"):
+        film_duration_sec = kwargs.get('film_duration_sec')
+        if not film_duration_sec:
+            # Fallback to getting duration if not passed, for safety
+            film_duration_sec = get_duration(source_video_path)
+
+        return _process_segment_from_beats(
+            segment_data, vo_audio_path, source_video_path, work_dir,
+            film_duration_sec, stop_event, **kwargs
+        )
+
+    # --- Fallback to original timeblock-based processing ---
+    segment_label = segment_data['label']
+    progress_callback = kwargs.get('progress_callback', lambda msg: print(msg))
+    progress_callback(f"--- Memulai proses segmen (mode Timeblocks): {segment_label} ---")
+
+    segment_work_dir = work_dir / segment_label
+    segment_work_dir.mkdir(exist_ok=True)
+
+    timeblock_clips = []
+    for i, tb in enumerate(segment_data.get('source_timeblocks', [])):
+        if stop_event.is_set(): return None
+        start_time = tb['start'].replace(',', '.')
+        end_time = tb['end'].replace(',', '.')
+        start_sec = _ts_to_seconds(start_time)
+        end_sec = _ts_to_seconds(end_time)
+        duration = max(0.01, end_sec - start_sec)
+        clip_path = segment_work_dir / f"tb_{i}.mp4"
+        command = (
+            f"ffmpeg -ss {start_sec:.3f} -t {duration:.3f} -i \"{source_video_path}\" "
+            f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{clip_path}\""
+        )
+        if not run_ffmpeg_command(command, **kwargs):
+            progress_callback(f"ERROR: Gagal memotong timeblock {i} untuk {segment_label}")
+            return None
+        timeblock_clips.append(clip_path)
+
+    if not timeblock_clips:
+        progress_callback(f"Warning: Tidak ada timeblocks yang valid untuk segmen {segment_label}. Melewati.")
+        return None
+
+    if stop_event.is_set(): return None
+    concat_list_path = segment_work_dir / "concat_list.txt"
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for clip in timeblock_clips: f.write(f"file '{clip.resolve().as_posix()}'\n")
+
+    seg_raw_path = segment_work_dir / "seg_raw.mp4"
+    concat_command_1 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" "
+                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_raw_path}\"")
+    if not run_ffmpeg_command(concat_command_1, **kwargs): return None
+
+    if stop_event.is_set(): return None
+    cut_rules = segment_data.get('edit_rules', {})
+    split_time = (cut_rules.get('cut_length_sec', {}).get('min', 3) + cut_rules.get('cut_length_sec', {}).get('max', 4)) / 2
+    raw_clips_dir = segment_work_dir / "raw_clips"; raw_clips_dir.mkdir(exist_ok=True)
+    if not run_ffmpeg_command(f"ffmpeg -i \"{seg_raw_path}\" -c copy -map 0 -segment_time {split_time} -f segment -reset_timestamps 1 \"{raw_clips_dir / 'clip_%03d.mp4'}\"", **kwargs): return None
+
+    raw_clips = sorted(list(raw_clips_dir.glob("*.mp4"))); random.shuffle(raw_clips)
+    effected_clips_dir = segment_work_dir / "effected_clips"; effected_clips_dir.mkdir(exist_ok=True)
+    effect_rules = segment_data.get('edit_rules', {}); effects_pool, max_effects = effect_rules.get('effects_pool', []), effect_rules.get('max_effects_per_clip', 0)
+    effected_clips = []
+    for i, clip_path in enumerate(raw_clips):
+        if stop_event.is_set(): return None
+        num_effects = random.randint(0, max_effects); selected_effects = random.sample(effects_pool, num_effects) if num_effects > 0 else []
         output_path = effected_clips_dir / f"effected_{i:03d}.mp4"
-        if _apply_effects(clip_path, selected_effects, output_path, **kwargs):
-            effected_clips.append(output_path)
-            # Log applied effects per clip
-            if kwargs.get("progress_callback"):
-                try:
-                    d = get_duration(str(output_path)) or 0.0
-                    kwargs["progress_callback"](f"[Effects] Clip {i:03d}: {output_path.name} | effects={selected_effects} | dur={d:.2f}s")
-                except Exception:
-                    pass
+        if _apply_effects(clip_path, selected_effects, output_path, **kwargs): effected_clips.append(output_path)
+
+    if not effected_clips:
+        progress_callback(f"Warning: Tidak ada klip yang berhasil diproses dengan efek untuk {segment_label}. Melewati.")
+        return None
 
     if stop_event.is_set(): return None
     concat_list_path_2 = segment_work_dir / "concat_list_2.txt"
     with open(concat_list_path_2, "w", encoding="utf-8") as f:
-        for clip in effected_clips:
-            f.write(f"file '{_ffconcat_escape(clip)}'\n")
+        for clip in effected_clips: f.write(f"file '{clip.resolve().as_posix()}'\n")
     seg_joined_path = segment_work_dir / "seg_joined.mp4"
     concat_command_2 = (f"ffmpeg -f concat -safe 0 -i \"{concat_list_path_2}\" "
-                        f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 128k -ar 48000 -ac 2 \"{seg_joined_path}\"")
+                        f"-c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac \"{seg_joined_path}\"")
     if not run_ffmpeg_command(concat_command_2, **kwargs): return None
 
-    # Pastikan panjang video >= panjang VO agar narasi tidak terpotong
-    try:
-        vo_len = get_duration(vo_audio_path) or 0.0
-        vid_len = get_duration(str(seg_joined_path)) or 0.0
-    except Exception:
-        vo_len = 0.0; vid_len = 0.0
-
-    seg_input_for_mix = seg_joined_path
-    # Jika video sedikit lebih pendek dari VO, pad dengan tpad (jika gagal, fallback freeze-frame)
-    if vo_len > 0 and vid_len + 0.05 < vo_len:
-        pad_sec = max(0.0, float(vo_len) - float(vid_len) + 0.02)
-        padded_path = segment_work_dir / "seg_joined_padded.mp4"
-        pad_cmd = (f"ffmpeg -y -i \"{seg_joined_path}\" -vf \"tpad=stop_mode=clone:stop_duration={pad_sec:.3f}\" "
-                   f"-r 25 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -an \"{padded_path}\"")
-        padded_ok = run_ffmpeg_command(pad_cmd, **kwargs)
-        if not padded_ok:
-            # Fallback robust method if tpad filter is unavailable
-            padded_fb = _pad_video_with_still(seg_joined_path, vid_len, vo_len, segment_work_dir, **kwargs)
-            if padded_fb:
-                seg_input_for_mix = padded_fb
-                padded_ok = True
-        if padded_ok:
-            seg_input_for_mix = padded_path if padded_path.exists() else seg_input_for_mix
-            try:
-                kwargs.get("progress_callback", lambda *_: None)(
-                    f"[Sync] Padded video by {pad_sec:.2f}s to match VO ({vo_len:.2f}s)")
-            except Exception:
-                pass
-
     if stop_event.is_set(): return None
-    final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp4"
-    # Gabungkan video + VO, potong ke stream terpendek (VO) tanpa mengubah kecepatan
-    main_vol = kwargs.get("main_vo_volume", 1.0)
-    if main_vol and main_vol != 1.0:
-        cb = kwargs.get("progress_callback")
-        if cb:
-            try:
-                cb(f"Applying VO gain x{main_vol:.2f} for segment '{segment_label}'")
-            except Exception:
-                pass
-    # Gunakan durasi VO sebagai patokan total output (-t)
-    target_t = f"-t {float(vo_len):.3f}" if vo_len and vo_len > 0 else ""
-    if main_vol and main_vol != 1.0:
-        command = (f'ffmpeg -i \"{seg_input_for_mix}\" -i \"{vo_audio_path}\" '
-                   f'-filter_complex "[1:a]volume={main_vol}[a1]" '
-                   f'-map 0:v -map "[a1]" -r 25 -c:v libx264 -preset veryfast -crf 23 '
-                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 {target_t} \"{final_segment_path}\"')
-    else:
-        command = (f'ffmpeg -i \"{seg_input_for_mix}\" -i \"{vo_audio_path}\" '
-                   f'-map 0:v -map 1:a -r 25 -c:v libx264 -preset veryfast -crf 23 '
-                   f'-c:a aac -b:a 128k -ar 48000 -ac 2 {target_t} \"{final_segment_path}\"')
+    vo_duration = get_duration(vo_audio_path); video_duration = get_duration(seg_joined_path)
+    if not vo_duration or not video_duration: return None
+
+    final_segment_path = work_dir / f"seg_{segment_label.lower()}.mp4" # FIX: Outputting mp4
+    command = (f'ffmpeg -i \"{seg_joined_path}\" -i \"{vo_audio_path}\" '
+               f'-filter_complex "[0:v]setpts=({vo_duration}/{video_duration})*PTS[v]" '
+               f'-map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k "{final_segment_path}"')
     if not run_ffmpeg_command(command, **kwargs): return None
     return final_segment_path
 
-def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, user_settings: dict, stop_event: threading.Event, progress_callback=None):
+def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, user_settings: dict, film_duration_sec: float, stop_event: threading.Event, progress_callback=None):
     base_dir = pathlib.Path(source_video_path).parent
     work_dir = base_dir / "temp_restory_work"
-    kwargs = {"progress_callback": progress_callback, "main_vo_volume": user_settings.get("main_vo_volume", 1.0)}
+    kwargs = {"progress_callback": progress_callback}
 
     try:
         if work_dir.exists(): shutil.rmtree(work_dir)
@@ -582,7 +448,9 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
         segment_order = []
         selected_segments = user_settings.get("selected_segments", [])
 
-        selected_set = set(selected_segments)
+        # Pass film_duration_sec to kwargs to be available in _process_segment
+        kwargs['film_duration_sec'] = film_duration_sec
+
         for segment_data in storyboard.get('segments', []):
             if stop_event.is_set(): raise InterruptedError("Processing stopped by user.")
             segment_label = segment_data['label']
@@ -602,19 +470,12 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
                         progress_callback(f"--- Membersihkan file sementara untuk segmen: {segment_data['label']} ---")
                         shutil.rmtree(segment_work_dir)
                 else:
-                    # Segmen dipilih dan gagal -> hentikan seluruh proses agar cerita utuh.
-                    raise Exception(f"Segment '{segment_label}' failed or was stopped.")
+                    progress_callback(f"Segment {segment_label} failed or was stopped."); break
             else:
-                # VO hilang untuk segmen yang dipilih -> ini error fatal.
-                raise Exception(f"No voice-over audio found for selected segment '{segment_label}'.")
+                progress_callback(f"Warning: No voice-over audio found for segment '{segment_label}'. Skipping.")
 
         if stop_event.is_set() or not processed_segment_paths:
             raise InterruptedError("Processing stopped or no segments were completed.")
-
-        # Validasi: semua segmen terpilih harus berhasil diproses (cerita utuh)
-        if len(processed_segment_paths) != len(selected_segments):
-            missing = [s for s in selected_segments if s not in segment_order]
-            raise Exception(f"Incomplete rendering. Missing segments: {', '.join(missing)}")
 
         # Branch: concat all vs export per-segment
         if user_settings.get("process_all", True):
@@ -622,8 +483,7 @@ def process_video(storyboard: dict, source_video_path: str, vo_audio_map: dict, 
             if len(processed_segment_paths) > 1:
                 concat_list_path = work_dir / "final_concat_list.txt"
                 with open(concat_list_path, "w", encoding="utf-8") as f:
-                    for p in processed_segment_paths:
-                        f.write(f"file '{_ffconcat_escape(p)}'\n")
+                    for p in processed_segment_paths: f.write(f"file '{p.resolve().as_posix()}'\n")
                 command = f"ffmpeg -f concat -safe 0 -i \"{concat_list_path}\" -c copy \"{concat_video_path}\""
                 if not run_ffmpeg_command(command, **kwargs): raise Exception("Final concatenation failed.")
             else:
