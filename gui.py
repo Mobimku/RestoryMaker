@@ -363,7 +363,7 @@ class App(ctk.CTk):
 
             # Sisipkan peta VO ke user_settings agar processor bisa menghitung timing BGM
             user_settings["_vo_audio_map"] = vo_audio_map
-            final_path = video_processor.process_video(storyboard, self.mp4_path.get(), vo_audio_map, user_settings, self.stop_event, self.log_message)
+            final_path = video_processor.process_video(storyboard, self.mp4_path.get(), vo_audio_map, user_settings, film_duration_sec, self.stop_event, self.log_message)
             if not final_path: raise Exception("Pemrosesan video gagal.")
             if isinstance(final_path, list):
                 self.log_message("SUKSES: Proses selesai. Video per-segmen:")
